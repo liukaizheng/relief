@@ -1,0 +1,15 @@
+# Build artifacts
+/build/
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+
+# VS Code
+.vscode/ipch
+.cache/
+
+# macOS
+.DS_Store
