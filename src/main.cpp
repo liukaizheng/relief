@@ -1,11 +1,24 @@
 #include <CGAL/Exact_predicates_inexact_constructions_kernel.h>
+#include <CGAL/Polygon_mesh_processing/polygon_soup_to_polygon_mesh.h>
 #include <CGAL/IO/polygon_mesh_io.h>
 #include <CGAL/Surface_mesh.h>
 #include <CGAL/boost/graph/Euler_operations.h>
 #include <CGAL/boost/graph/helpers.h>
+#include <CGAL/IO/polygon_mesh_io.h>
+
 #include <CLI/CLI.hpp>
+
 #include <fmt/core.h>
+#include <fmt/os.h>
+#include <fmt/format.h>
 #include <Eigen/Core>
+
+#include <geometrycentral/surface/meshio.h>
+#include <geometrycentral/surface/trace_geodesic.h>
+#include <geometrycentral/surface/surface_mesh.h>
+#include <geometrycentral/surface/surface_point.h>
+#include <geometrycentral/utilities/vector2.h>
+#include <geometrycentral/utilities/vector3.h>
 
 #include <algorithm>
 #include <cmath>
@@ -18,7 +31,18 @@
 using Kernel = CGAL::Exact_predicates_inexact_constructions_kernel;
 using Point_3 = Kernel::Point_3;
 using Mesh = CGAL::Surface_mesh<Point_3>;
+using VI = Mesh::Vertex_index;
+using HI = Mesh::Halfedge_index;
+using EI = Mesh::Edge_index;
+using FI = Mesh::Face_index;
+
 using VMat2 = Eigen::Matrix<double, Eigen::Dynamic, 2, Eigen::RowMajor, Eigen::Dynamic, 2>;
+using GV3 = geometrycentral::Vector3;
+using GMesh = geometrycentral::surface::SurfaceMesh;
+
+
+namespace gs = geometrycentral::surface;
+namespace PMP =  CGAL::Polygon_mesh_processing;
 
 namespace {
 struct Bounds {
@@ -92,6 +116,85 @@ std::size_t remove_faces_on_min_plane(Mesh& mesh, double min_z,
 
     return faces_to_remove.size();
 }
+
+void write_polyline(const std::string& name, const std::vector<gs::SurfacePoint>& points, gs::VertexData<geometrycentral::Vector3>& vertexData) {
+    auto out = fmt::output_file(name);
+    for (const auto& point : points) {
+        const auto p = point.interpolate(vertexData);
+        out.print("v {} {} {}\n", p.x, p.y, p.z);
+    }
+
+    for (std::size_t i = 0; i + 1 < points.size(); i++) {
+        const auto j = i + 1;
+        out.print("l {} {}\n", i + 1, j + 1);
+    }
+    out.close();
+}
+
+auto split_edge(const EI& eid, Mesh& mesh, Point_3 pt) {
+    const auto new_hid = CGAL::Euler::split_edge(mesh.halfedge(eid), mesh);
+    const auto new_vid = mesh.target(new_hid);
+    mesh.point(new_vid) = std::move(pt);
+    return new_vid;
+}
+
+auto split_face(const FI& fid, Mesh& mesh, Point_3 pt) {
+    const auto new_hid = CGAL::Euler::add_center_vertex(mesh.halfedge(fid), mesh);
+    const auto new_vid = mesh.target(new_hid);
+    mesh.point(new_vid) = std::move(pt);
+    return new_vid;
+}
+
+auto add_corner_points(const std::string& name) {
+    auto [gmesh, geometry] = gs::readManifoldSurfaceMesh(name);
+    fmt::println(
+        "Loaded mesh '{}'\n- Vertices: {}\n- Faces: {}\n",
+        name, gmesh->nVertices(), gmesh->nFaces()
+    );
+
+    std::vector<Point_3> points;
+    std::vector<std::vector<std::size_t>> faces;
+    for (const auto& vid : gmesh->vertices()) {
+        const auto& pt = geometry->vertexPositions[vid];
+        points.emplace_back(pt.x, pt.y, pt.z);
+    }
+    for (const auto& fid : gmesh->faces()) {
+        std::vector<std::size_t> face;
+        for (const auto vid : fid.adjacentVertices()) {
+            face.emplace_back(vid.getIndex());
+        }
+        faces.emplace_back(face);
+    }
+    Mesh mesh;
+    PMP::polygon_soup_to_polygon_mesh(points, faces, mesh);
+
+    gs::SurfacePoint center(gmesh->vertex(7008));
+    const double length = 0.3;
+
+    std::vector<VI> corners;
+    for (const auto [x, y] : {std::pair{-1., -1.}, {1., -1.}, {1., 1.}, {-1., 1.}}) {
+        const auto trace_ret = gs::traceGeodesic(*geometry, center, geometrycentral::Vector2{x, y} * length, {.includePath = true });
+        // write_polyline(fmt::format("polyline_{}_{}.obj", (int(x) + 1) >> 1, (int(y) + 1) >> 1), trace_ret.pathPoints, geometry->vertexPositions);
+        const auto& end_point = trace_ret.endPoint;
+        switch(end_point.type) {
+            case gs::SurfacePointType::Vertex:
+                corners.emplace_back(VI(end_point.vertex.getIndex()));
+                break;
+            case gs::SurfacePointType::Edge: {
+                auto [va, vb] = end_point.edge.adjacentVertices();
+                const auto pt = end_point.interpolate(geometry->vertexPositions);
+                corners.emplace_back(split_edge(mesh.edge(mesh.halfedge(VI(va.getIndex()), VI(vb.getIndex()))), mesh, {pt.x, pt.y, pt.z}));
+                break;
+            }
+            case gs::SurfacePointType::Face:
+                const auto pt = end_point.interpolate(geometry->vertexPositions);
+                corners.emplace_back(split_face(FI(end_point.face.getIndex()), mesh, {pt.x, pt.y, pt.z}));
+                break;
+        }
+    }
+    CGAL::IO::write_polygon_mesh("corner.obj", mesh);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -101,8 +204,6 @@ int main(int argc, char** argv) {
     app.add_option("-m,--mesh", mesh_path, "Path to mesh file")->required();
     app.add_option("-r,--relief", relief_path, "Path to relief file")->required();
     CLI11_PARSE(app, argc, argv);
-
-    (void)mesh_path;
 
     namespace fs = std::filesystem;
     const fs::path relief_input(relief_path);
@@ -158,5 +259,7 @@ int main(int argc, char** argv) {
     const auto max_pt = V.colwise().maxCoeff().eval();
     fmt::println("Min point: ({}, {})", min_pt.x(), min_pt.y());
     fmt::println("Max point: ({}, {})", max_pt.x(), max_pt.y());
+
+    add_corner_points(mesh_path);
     return 0;
 }

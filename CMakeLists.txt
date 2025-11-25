@@ -18,25 +18,30 @@ CPMAddPackage(
     GIT_TAG 12.1.0
     GITHUB_REPOSITORY fmtlib/fmt
     OPTIONS
-        "FMT_DOC=OFF"
-        "FMT_TEST=OFF"
-        "FMT_INSTALL=OFF"
+        "FMT_DOC OFF"
+        "FMT_TEST OFF"
+        "FMT_INSTALL OFF"
 )
 CPMAddPackage("gh:CLIUtils/CLI11#v2.6.1")
 CPMAddPackage(
-    NAME fmt
+    NAME geometry-central
     GIT_TAG master
     GITHUB_REPOSITORY liukaizheng/geometry-central
     OPTIONS
-        "SUITESPARSE=OFF"
+        "SUITESPARSE OFF"
 )
 
 add_executable(relief_app src/main.cpp)
 target_compile_features(relief_app PRIVATE cxx_std_23)
-target_link_libraries(relief_app PRIVATE fmt::fmt CGAL::CGAL CLI11::CLI11 Eigen3::Eigen)
+target_link_libraries(relief_app PRIVATE
+    fmt::fmt
+    CGAL::CGAL
+    CLI11::CLI11
+    Eigen3::Eigen
+    geometry-central)
 
-if(MSVC)
-    target_compile_options(relief_app PRIVATE /W4 /permissive- /WX)
-else()
-    target_compile_options(relief_app PRIVATE -Wall -Wextra -Wpedantic -Werror)
-endif()
+# if(MSVC)
+#     target_compile_options(relief_app PRIVATE /W4 /permissive- /WX)
+# else()
+#     target_compile_options(relief_app PRIVATE -Wall -Wextra -Wpedantic -Werror)
+# endif()
