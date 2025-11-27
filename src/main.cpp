@@ -13,12 +13,17 @@
 #include <fmt/format.h>
 #include <Eigen/Core>
 
+#include <format>
 #include <geometrycentral/surface/meshio.h>
 #include <geometrycentral/surface/trace_geodesic.h>
 #include <geometrycentral/surface/surface_mesh.h>
 #include <geometrycentral/surface/surface_point.h>
 #include <geometrycentral/utilities/vector2.h>
 #include <geometrycentral/utilities/vector3.h>
+#include <geometrycentral/surface/mesh_graph_algorithms.h>
+#include "geometrycentral/surface/halfedge_element_types.h"
+#include "geometrycentral/surface/surface_mesh_factories.h"
+#include <geometrycentral/surface/flip_geodesics.h>
 
 #include <algorithm>
 #include <cmath>
@@ -27,6 +32,7 @@
 #include <optional>
 #include <string>
 #include <vector>
+#include <ranges>
 
 using Kernel = CGAL::Exact_predicates_inexact_constructions_kernel;
 using Point_3 = Kernel::Point_3;
@@ -43,6 +49,8 @@ using GMesh = geometrycentral::surface::SurfaceMesh;
 
 namespace gs = geometrycentral::surface;
 namespace PMP =  CGAL::Polygon_mesh_processing;
+
+const auto& view_ts = std::views::transform;
 
 namespace {
 struct Bounds {
@@ -192,12 +200,40 @@ auto add_corner_points(const std::string& name) {
                 break;
         }
     }
-    CGAL::IO::write_polygon_mesh("corner.obj", mesh);
+    // CGAL::IO::write_polygon_mesh("corner.obj", mesh);
+    return std::make_pair(std::move(mesh), std::move(corners));
+}
+
+auto add_outline(const std::string& mesh_path) {
+    auto [mesh, corners] = add_corner_points(mesh_path);
+    const auto points = mesh.points() | view_ts([](const auto& p) { return GV3{p.x(), p.y(), p.z()}; }) | std::ranges::to<std::vector>();
+    const auto polygons = mesh.faces() | view_ts([&](const auto fid) { return mesh.vertices_around_face(mesh.halfedge(fid)) | view_ts([](const auto vid) { return (std::size_t) vid.idx();}) | std::ranges::to<std::vector>();}) | std::ranges::to<std::vector>();
+    auto [gmesh, geom] = gs::makeManifoldSurfaceMeshAndGeometry(polygons, points);
+    const auto gs_corners = corners | view_ts([&gmesh](const auto vid) { return gmesh->vertex(vid.idx()); }) | std::ranges::to<std::vector>();
+
+    std::vector<std::vector<gs::Halfedge>> path_halfedges;
+    for (std::size_t i = 0; i < gs_corners.size(); i++) {
+        const auto j = (i + 1) % gs_corners.size();
+        path_halfedges.push_back(gs::shortestEdgePath(*geom, gs_corners[i], gs_corners[j]));
+    }
+
+    gs::VertexData<bool> vertex_is_marked(*gmesh, false);
+    for (const auto& vid : gs_corners) {
+        vertex_is_marked[vid] = true;
+    }
+
+    gs::FlipEdgeNetwork network(*gmesh, *geom, path_halfedges, vertex_is_marked);
+    network.straightenAroundMarkedVertices = false;
+    network.iterativeShorten();
+    const auto paths = network.getPathPolyline();
+    for (std::size_t i = 0; i < paths.size(); i++) {
+        write_polyline(std::format("path{}.obj", i), paths[i], geom->vertexPositions);
+    }
 }
 
 }  // namespace
 
-int main(int argc, char** argv) {
+int main1(int argc, char** argv) {
     CLI::App app{"Relief App"};
     std::string mesh_path;
     std::string relief_path;
@@ -260,6 +296,50 @@ int main(int argc, char** argv) {
     fmt::println("Min point: ({}, {})", min_pt.x(), min_pt.y());
     fmt::println("Max point: ({}, {})", max_pt.x(), max_pt.y());
 
-    add_corner_points(mesh_path);
+    add_outline(mesh_path);
     return 0;
+}
+int main(int argc, char** argv) {
+    CLI::App app{"Relief App"};
+    std::string mesh_path;
+    app.add_option("-m,--mesh", mesh_path, "Path to mesh file")->required();
+    CLI11_PARSE(app, argc, argv);
+    auto [mesh, geom] = gs::readManifoldSurfaceMesh(mesh_path);
+    std::vector<std::size_t> path_indices1{0, 1, 5, 7};
+    std::vector<std::size_t> path_indices2{7, 5, 4};
+
+    auto to_halfedges_path = [&](const std::vector<std::size_t>& path) {
+        std::vector<gs::Halfedge> halfedges;
+        for (std::size_t i = 0; i < path.size() - 1; ++i) {
+            const auto va = mesh->vertex(path[i]);
+            const auto vb = mesh->vertex(path[i + 1]);
+            const auto edge = mesh->connectingEdge(va, vb);
+            const auto he = edge.halfedge();
+            if (he.tailVertex() == va) {
+                halfedges.push_back(he);
+            } else {
+                halfedges.emplace_back(he.twin());
+            }
+        }
+        return halfedges;
+    };
+
+    const auto path1 = to_halfedges_path(path_indices1);
+    const auto path2 = to_halfedges_path(path_indices2);
+    std::vector<std::vector<gs::Halfedge>> path_halfedges {path1, path2};
+    gs::VertexData<bool> vertex_is_marked(*mesh, false);
+    vertex_is_marked[mesh->vertex(0)] = true;
+    vertex_is_marked[mesh->vertex(4)] = true;
+    vertex_is_marked[mesh->vertex(7)] = true;
+    gs::FlipEdgeNetwork network(*mesh, *geom, path_halfedges, vertex_is_marked);
+    network.straightenAroundMarkedVertices = false;
+    network.iterativeShorten();
+    const auto paths = network.getPathPolyline();
+    write_polyline("path1.obj", paths[0], geom->vertexPositions);
+    write_polyline("path2.obj", paths[1], geom->vertexPositions);
+
+    for (const auto vid : mesh->vertices()) {
+        const auto& pt = geom->vertexPositions[vid];
+        fmt::println("Vertex position: ({}, {}, {})", pt.x, pt.y, pt.z);
+    }
 }

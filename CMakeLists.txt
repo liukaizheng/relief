@@ -30,6 +30,7 @@ CPMAddPackage(
     OPTIONS
         "SUITESPARSE OFF"
 )
+CPMAddPackage("gh:liukaizheng/libigl#main")
 
 add_executable(relief_app src/main.cpp)
 target_compile_features(relief_app PRIVATE cxx_std_23)
@@ -38,7 +39,9 @@ target_link_libraries(relief_app PRIVATE
     CGAL::CGAL
     CLI11::CLI11
     Eigen3::Eigen
-    geometry-central)
+    geometry-central
+    igl::core
+)
 
 # if(MSVC)
 #     target_compile_options(relief_app PRIVATE /W4 /permissive- /WX)

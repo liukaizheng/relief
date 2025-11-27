@@ -6,7 +6,7 @@
             "type": "lldb",
             "request": "launch",
             "program": "${workspaceFolder}/build/relief_app",
-            "args": ["-m", "bunny.obj", "-r", "reliefSculpture.obj"],
+            "args": ["-m", "cube.obj"],
             "cwd": "${workspaceFolder}/build",
             "env": {},
             "stopOnEntry": false,
