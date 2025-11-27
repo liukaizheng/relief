@@ -31,6 +31,7 @@
 #include <limits>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 #include <ranges>
 
@@ -139,21 +140,7 @@ void write_polyline(const std::string& name, const std::vector<gs::SurfacePoint>
     out.close();
 }
 
-auto split_edge(const EI& eid, Mesh& mesh, Point_3 pt) {
-    const auto new_hid = CGAL::Euler::split_edge(mesh.halfedge(eid), mesh);
-    const auto new_vid = mesh.target(new_hid);
-    mesh.point(new_vid) = std::move(pt);
-    return new_vid;
-}
-
-auto split_face(const FI& fid, Mesh& mesh, Point_3 pt) {
-    const auto new_hid = CGAL::Euler::add_center_vertex(mesh.halfedge(fid), mesh);
-    const auto new_vid = mesh.target(new_hid);
-    mesh.point(new_vid) = std::move(pt);
-    return new_vid;
-}
-
-auto add_corner_points(const std::string& name) {
+auto add_corner_points(const std::string& name, Eigen::Vector2d min_pt, Eigen::Vector2d max_pt, const std::size_t n_fines) {
     auto [gmesh, geometry] = gs::readManifoldSurfaceMesh(name);
     fmt::println(
         "Loaded mesh '{}'\n- Vertices: {}\n- Faces: {}\n",
@@ -175,36 +162,54 @@ auto add_corner_points(const std::string& name) {
     }
     Mesh mesh;
     PMP::polygon_soup_to_polygon_mesh(points, faces, mesh);
+    const auto stride = 1.0 / n_fines;
 
-    gs::SurfacePoint center(gmesh->vertex(7008));
-    const double length = 0.3;
+    gs::SurfacePoint srf_center(gmesh->vertex(7008));
+    const auto center_pt = ((min_pt + max_pt) * 0.5).eval();
+    std::vector<Eigen::Vector2d, Eigen::aligned_allocator<Eigen::Vector2d>> corner_points{min_pt, {max_pt.x(), min_pt.y()}, max_pt, {min_pt.x(), max_pt.y()}};
+    std::vector<Point_3> boundary_points;
+    std::vector<VI> vertex_indices(n_fines * 4);
+    boundary_points.reserve(n_fines * 4);
+    std::unordered_map<EI, std::vector<std::size_t>> edge_points_map;
+    std::unordered_map<FI, std::vector<std::size_t>> face_points_map;
 
-    std::vector<VI> corners;
-    for (const auto [x, y] : {std::pair{-1., -1.}, {1., -1.}, {1., 1.}, {-1., 1.}}) {
-        const auto trace_ret = gs::traceGeodesic(*geometry, center, geometrycentral::Vector2{x, y} * length, {.includePath = true });
-        // write_polyline(fmt::format("polyline_{}_{}.obj", (int(x) + 1) >> 1, (int(y) + 1) >> 1), trace_ret.pathPoints, geometry->vertexPositions);
-        const auto& end_point = trace_ret.endPoint;
-        switch(end_point.type) {
-            case gs::SurfacePointType::Vertex:
-                corners.emplace_back(VI(end_point.vertex.getIndex()));
-                break;
-            case gs::SurfacePointType::Edge: {
-                auto [va, vb] = end_point.edge.adjacentVertices();
-                const auto pt = end_point.interpolate(geometry->vertexPositions);
-                corners.emplace_back(split_edge(mesh.edge(mesh.halfedge(VI(va.getIndex()), VI(vb.getIndex()))), mesh, {pt.x, pt.y, pt.z}));
-                break;
+    for (std::size_t i = 0; i < corner_points.size(); i++) {
+        const auto& pa = corner_points[i];
+        const auto& pb = corner_points[(i + 1) % corner_points.size()];
+        for (std::size_t j = 0; j < n_fines; j++) {
+            const auto t = j * stride;
+            const auto pt_2d = (1.0 - t) * pa + t * pb;
+            const auto vec = pt_2d - center_pt;
+            const auto trace_ret = gs::traceGeodesic(*geometry, srf_center, geometrycentral::Vector2{vec[0], vec[1]}, {.includePath = true});
+            const auto& end_point = trace_ret.endPoint;
+            const auto pt = end_point.interpolate(geometry->vertexPositions);
+            const auto pid = boundary_points.size();
+            boundary_points.emplace_back(pt.x, pt.y, pt.z);
+            switch(end_point.type) {
+                case gs::SurfacePointType::Vertex: {
+                    vertex_indices[pid] = VI(end_point.vertex.getIndex());
+                    break;
+                }
+                case gs::SurfacePointType::Edge: {
+                    auto [va, vb] = end_point.edge.adjacentVertices();
+                    const auto eid = mesh.edge(mesh.halfedge(VI(va.getIndex()), VI(vb.getIndex())));
+                    edge_points_map[eid].emplace_back(pid);
+                    break;
+                }
+                case gs::SurfacePointType::Face:
+                    face_points_map[FI(end_point.face.getIndex())].emplace_back(pid);
+                    break;
             }
-            case gs::SurfacePointType::Face:
-                const auto pt = end_point.interpolate(geometry->vertexPositions);
-                corners.emplace_back(split_face(FI(end_point.face.getIndex()), mesh, {pt.x, pt.y, pt.z}));
-                break;
         }
     }
+
+    const auto a = 2;
+
+
     // CGAL::IO::write_polygon_mesh("corner.obj", mesh);
-    return std::make_pair(std::move(mesh), std::move(corners));
 }
 
-auto add_outline(const std::string& mesh_path) {
+/*auto add_outline(const std::string& mesh_path) {
     auto [mesh, corners] = add_corner_points(mesh_path);
     const auto points = mesh.points() | view_ts([](const auto& p) { return GV3{p.x(), p.y(), p.z()}; }) | std::ranges::to<std::vector>();
     const auto polygons = mesh.faces() | view_ts([&](const auto fid) { return mesh.vertices_around_face(mesh.halfedge(fid)) | view_ts([](const auto vid) { return (std::size_t) vid.idx();}) | std::ranges::to<std::vector>();}) | std::ranges::to<std::vector>();
@@ -229,11 +234,18 @@ auto add_outline(const std::string& mesh_path) {
     for (std::size_t i = 0; i < paths.size(); i++) {
         write_polyline(std::format("path{}.obj", i), paths[i], geom->vertexPositions);
     }
-}
+    }*/
 
 }  // namespace
 
-int main1(int argc, char** argv) {
+void scale_box(Eigen::Vector2d& min_pt, Eigen::Vector2d& max_pt, const double s) {
+    const auto center = (min_pt + max_pt) / 2.0;
+    const auto vec = ((max_pt - center) * s).eval();
+    max_pt = center + vec;
+    min_pt = center - vec;
+}
+
+int main(int argc, char** argv) {
     CLI::App app{"Relief App"};
     std::string mesh_path;
     std::string relief_path;
@@ -291,55 +303,13 @@ int main1(int argc, char** argv) {
     for (const auto& pt : relief.points()) {
         V.row(idx++) << pt.x(), pt.y();
     }
-    const auto min_pt = V.colwise().minCoeff().eval();
-    const auto max_pt = V.colwise().maxCoeff().eval();
+    auto min_pt = V.colwise().minCoeff().transpose().eval();
+    auto max_pt = V.colwise().maxCoeff().transpose().eval();
     fmt::println("Min point: ({}, {})", min_pt.x(), min_pt.y());
     fmt::println("Max point: ({}, {})", max_pt.x(), max_pt.y());
 
-    add_outline(mesh_path);
+    scale_box(min_pt, max_pt, 0.04);
+    add_corner_points(mesh_path, min_pt, max_pt, 8);
+
     return 0;
-}
-int main(int argc, char** argv) {
-    CLI::App app{"Relief App"};
-    std::string mesh_path;
-    app.add_option("-m,--mesh", mesh_path, "Path to mesh file")->required();
-    CLI11_PARSE(app, argc, argv);
-    auto [mesh, geom] = gs::readManifoldSurfaceMesh(mesh_path);
-    std::vector<std::size_t> path_indices1{0, 1, 5, 7};
-    std::vector<std::size_t> path_indices2{7, 5, 4};
-
-    auto to_halfedges_path = [&](const std::vector<std::size_t>& path) {
-        std::vector<gs::Halfedge> halfedges;
-        for (std::size_t i = 0; i < path.size() - 1; ++i) {
-            const auto va = mesh->vertex(path[i]);
-            const auto vb = mesh->vertex(path[i + 1]);
-            const auto edge = mesh->connectingEdge(va, vb);
-            const auto he = edge.halfedge();
-            if (he.tailVertex() == va) {
-                halfedges.push_back(he);
-            } else {
-                halfedges.emplace_back(he.twin());
-            }
-        }
-        return halfedges;
-    };
-
-    const auto path1 = to_halfedges_path(path_indices1);
-    const auto path2 = to_halfedges_path(path_indices2);
-    std::vector<std::vector<gs::Halfedge>> path_halfedges {path1, path2};
-    gs::VertexData<bool> vertex_is_marked(*mesh, false);
-    vertex_is_marked[mesh->vertex(0)] = true;
-    vertex_is_marked[mesh->vertex(4)] = true;
-    vertex_is_marked[mesh->vertex(7)] = true;
-    gs::FlipEdgeNetwork network(*mesh, *geom, path_halfedges, vertex_is_marked);
-    network.straightenAroundMarkedVertices = false;
-    network.iterativeShorten();
-    const auto paths = network.getPathPolyline();
-    write_polyline("path1.obj", paths[0], geom->vertexPositions);
-    write_polyline("path2.obj", paths[1], geom->vertexPositions);
-
-    for (const auto vid : mesh->vertices()) {
-        const auto& pt = geom->vertexPositions[vid];
-        fmt::println("Vertex position: ({}, {}, {})", pt.x, pt.y, pt.z);
-    }
 }
