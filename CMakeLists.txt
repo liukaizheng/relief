@@ -32,7 +32,10 @@ CPMAddPackage(
 )
 CPMAddPackage("gh:liukaizheng/libigl#main")
 
-add_executable(relief_app src/main.cpp)
+add_executable(relief_app
+    src/flatten_surface.cpp
+    src/main.cpp
+)
 target_compile_features(relief_app PRIVATE cxx_std_23)
 target_link_libraries(relief_app PRIVATE
     fmt::fmt
@@ -41,6 +44,9 @@ target_link_libraries(relief_app PRIVATE
     Eigen3::Eigen
     geometry-central
     igl::core
+)
+target_include_directories(relief_app PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 
 # if(MSVC)

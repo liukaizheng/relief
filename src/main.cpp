@@ -2,6 +2,7 @@
 #include <CGAL/Constrained_Delaunay_triangulation_face_base_2.h>
 #include <CGAL/Exact_predicates_inexact_constructions_kernel.h>
 #include <CGAL/IO/polygon_mesh_io.h>
+#include <CGAL/IO/polygon_soup_io.h>
 #include <CGAL/Polygon_mesh_processing/polygon_soup_to_polygon_mesh.h>
 #include <CGAL/Polygon_mesh_processing/triangulate_faces.h>
 #include <CGAL/Surface_mesh.h>
@@ -27,6 +28,8 @@
 #include <geometrycentral/surface/trace_geodesic.h>
 #include <geometrycentral/utilities/vector2.h>
 #include <geometrycentral/utilities/vector3.h>
+
+#include "flatten_surface.h"
 
 #include <algorithm>
 #include <cmath>
@@ -516,8 +519,30 @@ auto embed_planar_grid_boundary(const std::string& input_mesh_path, const Eigen:
 
     return make_tuple(std::move(cgal_mesh), std::move(boundary_halfedges), std::move(segment_offsets));
 }
-
-} // namespace
+auto surround_faces(const Mesh& mesh, const std::vector<Mesh ::Halfedge_index>& halfedges)
+{
+    std::vector<bool> visited(mesh.number_of_faces() + mesh.number_of_removed_faces(), false);
+    std::vector<Mesh::Face_index> faces;
+    for (const auto hid : halfedges) {
+        visited[mesh.face(mesh.opposite(hid))] = true;
+        const auto fid = mesh.face(hid);
+        if (!visited[fid]) {
+            faces.emplace_back(fid);
+            visited[fid] = true;
+        }
+    }
+    for (std::size_t i = 0; i < faces.size(); i++) {
+        const auto curr_fid = faces[i];
+        for (const auto hid : mesh.halfedges_around_face(mesh.halfedge(curr_fid))) {
+            const auto oppo_fid = mesh.face(mesh.opposite(hid));
+            if (!visited[oppo_fid]) {
+                faces.emplace_back(oppo_fid);
+                visited[oppo_fid] = true;
+            }
+        }
+    }
+    return faces;
+}
 
 void scale_box(Eigen::Vector2d& min_pt, Eigen::Vector2d& max_pt, const double s)
 {
@@ -526,6 +551,39 @@ void scale_box(Eigen::Vector2d& min_pt, Eigen::Vector2d& max_pt, const double s)
     max_pt = center + vec;
     min_pt = center - vec;
 }
+
+auto extract_faces(const Mesh& mesh, const std::vector<FI>& faces, std::vector<HI>& boundary_halfedges) {
+    constexpr auto INVALID = std::numeric_limits<std::size_t>::max();
+    std::vector<std::size_t> point_map(mesh.number_of_vertices() + mesh.number_of_removed_vertices(), INVALID);
+    std::vector<Point_3> points;
+    std::vector<VI> point_vertices;
+    for (const auto hid : boundary_halfedges) {
+        const auto vid = mesh.source(hid);
+        if (point_map[vid] == INVALID) {
+            point_map[vid] = points.size();
+            points.emplace_back(mesh.point(vid));
+            point_vertices.emplace_back(vid);
+        }
+    }
+
+    std::vector<std::vector<std::size_t>> face_vertices;
+    for (const auto fid : faces) {
+        std::vector<std::size_t> vertices;
+        for (const auto vid : mesh.vertices_around_face(mesh.halfedge(fid))) {
+            if (point_map[vid] == INVALID) {
+                point_map[vid] = points.size();
+                points.emplace_back(mesh.point(vid));
+                point_vertices.emplace_back(vid);
+            }
+            vertices.push_back(point_map[vid]);
+        }
+        face_vertices.emplace_back(vertices);
+    }
+    return std::make_tuple(std::move(points), std::move(point_vertices), std::move(face_vertices));
+}
+
+} // namespace
+
 
 int main(int argc, char** argv)
 {
@@ -587,6 +645,9 @@ int main(int argc, char** argv)
     fmt::println("Max point: ({}, {})", max_pt.x(), max_pt.y());
 
     scale_box(min_pt, max_pt, 0.02);
-    embed_planar_grid_boundary(mesh_path, min_pt, max_pt, 16, grid_dimension);
+    auto [mesh, boundary_halfedges, segment_offset] = embed_planar_grid_boundary(mesh_path, min_pt, max_pt, 16, grid_dimension);
+    const auto faces = surround_faces(mesh, boundary_halfedges);
+    auto [patch_points, patch_vertices, patch_faces] = extract_faces(mesh, faces, boundary_halfedges);
+    CGAL::IO::write_polygon_soup("mesh2.obj", patch_points, patch_faces);
     return 0;
 }
