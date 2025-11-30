@@ -55,7 +55,6 @@ using Fb = CGAL::Constrained_triangulation_face_base_2<Kernel, Fb_info>;
 using Tds = CGAL::Triangulation_data_structure_2<Vb, Fb>;
 using CDT = CGAL::Constrained_Delaunay_triangulation_2<Kernel, Tds>;
 
-using VMat2 = Eigen::Matrix<double, Eigen::Dynamic, 2, Eigen::RowMajor, Eigen::Dynamic, 2>;
 using GV3 = geometrycentral::Vector3;
 using GMesh = geometrycentral::surface::SurfaceMesh;
 
@@ -489,8 +488,12 @@ auto embed_planar_grid_boundary(const std::string& input_mesh_path, const Eigen:
     }
 
     // for (std::size_t i = 0; i < boundary_segments.size(); i++) {
-    //     write_polyline(fmt::format("outline_{}.obj", i), boundary_segments[i], gc_geometry->vertexPositions);
+    //     auto temp = boundary_segments[i];
+    //     const auto j = (i + 1) % boundary_segments.size();
+    //     temp.emplace_back(boundary_segments[j].front());
+    //     write_polyline(fmt::format("outline_{}.obj", i), temp, gc_geometry->vertexPositions);
     // }
+    // CGAL::IO::write_polygon_mesh("mesh1.obj", cgal_mesh);
 
     std::vector<Point_3> new_vertex_positions;
     std::vector<VI> new_boundary_indices;
@@ -512,7 +515,6 @@ auto embed_planar_grid_boundary(const std::string& input_mesh_path, const Eigen:
         boundary_halfedges.emplace_back(hid);
     }
     PMP::triangulate_faces(cgal_mesh);
-    // CGAL::IO::write_polygon_mesh("mesh1.obj", cgal_mesh);
 
     // const double grid_stride = 1.0 / grid_cells_per_axis;
     // const auto grid_sample_t_arr = std::ranges::iota_view{0ull, grid_cells_per_axis} | view_ts([grid_stride] (const auto i)  { return grid_stride * i; }) | std::ranges::to<std::vector>();
@@ -582,6 +584,31 @@ auto extract_faces(const Mesh& mesh, const std::vector<FI>& faces, std::vector<H
     return std::make_tuple(std::move(points), std::move(point_vertices), std::move(face_vertices));
 }
 
+auto mesh_to_eigen_mat(const std::vector<Point_3>& points, std::vector<std::vector<std::size_t>>& faces) {
+    VMat V(points.size(), 3);
+    for (std::size_t i = 0; i < points.size(); ++i) {
+        V.row(i) << points[i].x(), points[i].y(), points[i].z();
+    }
+
+    FMat F(faces.size(), 3);
+    for (std::size_t i = 0; i < faces.size(); ++i) {
+        F.row(i) << faces[i][0], faces[i][1], faces[i][2];
+    }
+
+    return std::make_pair(std::move(V), std::move(F));
+}
+
+auto write_uv(const std::string& name, const VMat2& uv, const FMat& F) {
+    std::ofstream file(name);
+    for (Eigen::Index i = 0; i < uv.rows(); ++i) {
+        file << "v " << uv(i, 0) << " " << uv(i, 1) << " 0\n";
+    }
+    for (Eigen::Index i = 0; i < F.rows(); ++i) {
+        file << "f " << F(i, 0) + 1 << " " << F(i, 1) + 1 << " " << F(i, 2) + 1 << "\n";
+    }
+    file.close();
+}
+
 } // namespace
 
 
@@ -648,6 +675,10 @@ int main(int argc, char** argv)
     auto [mesh, boundary_halfedges, segment_offset] = embed_planar_grid_boundary(mesh_path, min_pt, max_pt, 16, grid_dimension);
     const auto faces = surround_faces(mesh, boundary_halfedges);
     auto [patch_points, patch_vertices, patch_faces] = extract_faces(mesh, faces, boundary_halfedges);
-    CGAL::IO::write_polygon_soup("mesh2.obj", patch_points, patch_faces);
+
+    auto fv_mat = mesh_to_eigen_mat(patch_points, patch_faces);
+    FlattenSurface flatten_surface(std::move(fv_mat.first), std::move(fv_mat.second), segment_offset);
+    flatten_surface.slim_solve(10);
+    write_uv("uv.obj", flatten_surface.uv, flatten_surface.F);
     return 0;
 }
