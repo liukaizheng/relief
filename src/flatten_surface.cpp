@@ -19,7 +19,6 @@ auto write_uv(const std::string& name, const VMat2& uv, const FMat& F) {
 }
 
 FlattenSurface::FlattenSurface(VMat&& V, FMat&& F, const std::vector<std::size_t>& segment_offsets) noexcept : V(std::move(V)), F(std::move(F)), n_bnd_points(segment_offsets.back()) {
-    using IVec = Eigen::Matrix<std::size_t, Eigen::Dynamic, 1>;
     IVec I1;
     IVec I2;
     IVec I = IVec::LinSpaced(3, 0 ,2);
@@ -197,21 +196,48 @@ VMat2 FlattenSurface::solve_weighted_arap() {
     } else {
         igl::sparse_cached(triplets, A_data, A);
     }
-    Eigen::SparseMatrix<double> id_m(A.cols(), A.cols());
-    id_m.setIdentity();
-    AtA_data.W = WGL_M;
-    if (AtA.rows() == 0) {
-        igl::AtA_cached_precompute(A, AtA_data,AtA);
-    } else {
-        igl::AtA_cached(A,AtA_data,AtA);
 
-    }
-    Eigen::SparseMatrix<double> L = AtA + proximal_p * id_m; //add also a proximal
+    Eigen::VectorXd bnd_uv_contribution = (A.leftCols(n_bnd_points) * uv.col(0).topRows(n_bnd_points)) + (A.middleCols(v_n, n_bnd_points) * uv.col(1).topRows(n_bnd_points));
+    // Eigen::SparseMatrix<double> id_m(A.cols(), A.cols());
+    // id_m.setIdentity();
+    // AtA_data.W = WGL_M;
+    // if (AtA.rows() == 0) {
+    //     igl::AtA_cached_precompute(A, AtA_data, AtA);
+    // } else {
+    //     igl::AtA_cached(A,AtA_data,AtA);
+
+    // }
+    //
+    Eigen::SparseMatrix<double> A1(A.rows(), A.cols() - 2 * n_bnd_points);
+    A1.leftCols(v_n - n_bnd_points) = A.middleCols(n_bnd_points, v_n - n_bnd_points);
+    A1.rightCols(v_n - n_bnd_points) = A.middleCols(v_n + n_bnd_points, v_n - n_bnd_points);
+    A1.makeCompressed();
+
+    Eigen::SparseMatrix<double> A1t = A1.transpose();
+    A1t.makeCompressed();
+
+    Eigen::SparseMatrix<double> L = A1t * WGL_M.asDiagonal() * A1;
+    // Eigen::SparseMatrix<double> L = AtA + proximal_p * id_m; //add also a proximal
     L.makeCompressed();
-    build_rhs();
+
+    Eigen::VectorXd f_rhs(4 * f_n);
+    f_rhs.setZero();
+    for (int i = 0; i < f_n; i++)
+    {
+        f_rhs(i + 0 * f_n) = W(i, 0) * Ri(i, 0) + W(i, 1) * Ri(i, 1);
+        f_rhs(i + 1 * f_n) = W(i, 0) * Ri(i, 2) + W(i, 1) * Ri(i, 3);
+        f_rhs(i + 2 * f_n) = W(i, 2) * Ri(i, 0) + W(i, 3) * Ri(i, 1);
+        f_rhs(i + 3 * f_n) = W(i, 2) * Ri(i, 2) + W(i, 3) * Ri(i, 3);
+    }
+    f_rhs -= bnd_uv_contribution;
+    rhs = A1t * WGL_M.asDiagonal() * f_rhs;
+
+    // build_rhs();
     Eigen::SimplicialLDLT<Eigen::SparseMatrix<double> > solver;
-    VMat2 new_uv(uv.rows(), uv.cols());
-    new_uv.reshaped(uv.rows() * uv.cols(), 1) = solver.compute(L).solve(rhs);
+    Eigen::VectorXd X = solver.compute(L).solve(rhs);
+    VMat2 new_uv = uv;
+    new_uv.col(0).bottomRows(v_n - n_bnd_points) = X.topRows(v_n - n_bnd_points);
+    new_uv.col(1).bottomRows(v_n - n_bnd_points) = X.bottomRows(v_n - n_bnd_points);
 
     return new_uv;
 }

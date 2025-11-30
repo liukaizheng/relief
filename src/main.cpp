@@ -679,6 +679,6 @@ int main(int argc, char** argv)
     auto fv_mat = mesh_to_eigen_mat(patch_points, patch_faces);
     FlattenSurface flatten_surface(std::move(fv_mat.first), std::move(fv_mat.second), segment_offset);
     flatten_surface.slim_solve(10);
-    write_uv("uv.obj", flatten_surface.uv, flatten_surface.F);
+    write_uv("uv1.obj", flatten_surface.uv, flatten_surface.F);
     return 0;
 }
