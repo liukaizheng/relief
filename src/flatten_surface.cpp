@@ -22,7 +22,7 @@ FlattenSurface::FlattenSurface(VMat&& V, FMat&& F, const std::vector<std::size_t
     IVec I1;
     IVec I2;
     IVec I = IVec::LinSpaced(3, 0 ,2);
-    double mean_edge_length = 0;
+    mean_edge_length = 0.0;
     std::vector<Eigen::VectorXd, Eigen::aligned_allocator<Eigen::VectorXd>> edge_coefficients;
     edge_coefficients.reserve(segment_offsets.size() - 1);
     for (std::size_t i = 0; i + 1 < segment_offsets.size(); ++i) {
@@ -308,6 +308,7 @@ void FlattenSurface::build_rhs() {
 
     rhs = (f_rhs.transpose() * WGL_M.asDiagonal() * A).transpose() + proximal_p * uv_flat;
 }
+
 double FlattenSurface::compute_energy(const VMat2& uv_new) {
     compute_jacobians(uv_new);
     double energy = 0;

@@ -1,9 +1,13 @@
+#include <CGAL/AABB_traits_2.h>
+#include <CGAL/AABB_tree.h>
+#include <CGAL/AABB_triangle_primitive_2.h>
 #include <CGAL/Constrained_Delaunay_triangulation_2.h>
 #include <CGAL/Constrained_Delaunay_triangulation_face_base_2.h>
 #include <CGAL/Exact_predicates_inexact_constructions_kernel.h>
 #include <CGAL/IO/polygon_mesh_io.h>
 #include <CGAL/IO/polygon_soup_io.h>
 #include <CGAL/Polygon_mesh_processing/polygon_soup_to_polygon_mesh.h>
+#include <CGAL/Polygon_mesh_processing/repair_polygon_soup.h>
 #include <CGAL/Polygon_mesh_processing/triangulate_faces.h>
 #include <CGAL/Surface_mesh.h>
 #include <CGAL/Triangulation_face_base_with_info_2.h>
@@ -14,6 +18,7 @@
 #include <CLI/CLI.hpp>
 
 #include <Eigen/Core>
+#include <array>
 #include <fmt/core.h>
 #include <fmt/format.h>
 #include <fmt/os.h>
@@ -29,11 +34,12 @@
 #include <geometrycentral/utilities/vector2.h>
 #include <geometrycentral/utilities/vector3.h>
 
+#include <igl/project_to_line_segment.h>
+
 #include "flatten_surface.h"
 
 #include <algorithm>
 #include <cmath>
-#include <filesystem>
 #include <limits>
 #include <optional>
 #include <ranges>
@@ -44,6 +50,7 @@
 using Kernel = CGAL::Exact_predicates_inexact_constructions_kernel;
 using Point_2 = Kernel::Point_2;
 using Point_3 = Kernel::Point_3;
+using Mesh_2 = CGAL::Surface_mesh<Point_2>;
 using Mesh = CGAL::Surface_mesh<Point_3>;
 using VI = Mesh::Vertex_index;
 using HI = Mesh::Halfedge_index;
@@ -54,6 +61,12 @@ using Fb_info = CGAL::Triangulation_face_base_with_info_2<bool, Kernel>;
 using Fb = CGAL::Constrained_triangulation_face_base_2<Kernel, Fb_info>;
 using Tds = CGAL::Triangulation_data_structure_2<Vb, Fb>;
 using CDT = CGAL::Constrained_Delaunay_triangulation_2<Kernel, Tds>;
+
+using Triangle_2 = Kernel::Triangle_2;
+using Iterator = std::vector<Triangle_2>::const_iterator;
+using Primitive = CGAL::AABB_triangle_primitive_2<Kernel, Iterator>;
+using AABB_triangle_traits = CGAL::AABB_traits_2<Kernel, Primitive>;
+using Tree = CGAL::AABB_tree<AABB_triangle_traits>;
 
 using GV3 = geometrycentral::Vector3;
 using GMesh = geometrycentral::surface::SurfaceMesh;
@@ -554,7 +567,8 @@ void scale_box(Eigen::Vector2d& min_pt, Eigen::Vector2d& max_pt, const double s)
     min_pt = center - vec;
 }
 
-auto extract_faces(const Mesh& mesh, const std::vector<FI>& faces, std::vector<HI>& boundary_halfedges) {
+auto extract_faces(const Mesh& mesh, const std::vector<FI>& faces, std::vector<HI>& boundary_halfedges)
+{
     constexpr auto INVALID = std::numeric_limits<std::size_t>::max();
     std::vector<std::size_t> point_map(mesh.number_of_vertices() + mesh.number_of_removed_vertices(), INVALID);
     std::vector<Point_3> points;
@@ -584,7 +598,8 @@ auto extract_faces(const Mesh& mesh, const std::vector<FI>& faces, std::vector<H
     return std::make_tuple(std::move(points), std::move(point_vertices), std::move(face_vertices));
 }
 
-auto mesh_to_eigen_mat(const std::vector<Point_3>& points, std::vector<std::vector<std::size_t>>& faces) {
+auto mesh_to_eigen_mat(const std::vector<Point_3>& points, std::vector<std::vector<std::size_t>>& faces)
+{
     VMat V(points.size(), 3);
     for (std::size_t i = 0; i < points.size(); ++i) {
         V.row(i) << points[i].x(), points[i].y(), points[i].z();
@@ -598,7 +613,8 @@ auto mesh_to_eigen_mat(const std::vector<Point_3>& points, std::vector<std::vect
     return std::make_pair(std::move(V), std::move(F));
 }
 
-auto write_uv(const std::string& name, const VMat2& uv, const FMat& F) {
+auto write_uv(const std::string& name, const VMat2& uv, const FMat& F)
+{
     std::ofstream file(name);
     for (Eigen::Index i = 0; i < uv.rows(); ++i) {
         file << "v " << uv(i, 0) << " " << uv(i, 1) << " 0\n";
@@ -609,8 +625,132 @@ auto write_uv(const std::string& name, const VMat2& uv, const FMat& F) {
     file.close();
 }
 
-} // namespace
+auto generate_grid_points(const std::size_t grid_dimension, const double edge_length)
+{
+    const auto X = Eigen::VectorXd::LinSpaced(grid_dimension, 0.0, edge_length).eval();
+    std::vector<Point_2> points;
+    points.reserve(X.size() * X.size());
+    for (std::size_t j = 0; j < X.size(); ++j) {
+        for (std::size_t i = 0; i < X.size(); ++i) {
+            points.push_back(Point_2(X(i), X(j)));
+        }
+    }
+    return points;
+}
 
+void locate_points_on_face(
+    const Mesh_2& mesh,
+    std::vector<Point_2>& all_query_points,
+    const FI fid,
+    std::vector<std::size_t>& face_points,
+    std::unordered_map<EI, std::vector<std::size_t>>& edge_points_map,
+    std::vector<VI>& point_vertex_indices,
+    VMat& bary_centers,
+    const double sq_tol)
+{
+    const auto h1 = mesh.halfedge(fid);
+    const auto h2 = mesh.next(h1);
+    const auto h3 = mesh.next(h2);
+    const std::array<HI, 3> halfedges = { h1, h2, h3 };
+    const std::array<VI, 3> vertices = { mesh.source(h1), mesh.source(h2), mesh.source(h3) };
+    const auto pts = vertices | view_ts([&mesh](VI vi) {
+        const auto& p = mesh.point(vi);
+        return Eigen::RowVector2d(p.x(), p.y());
+    }) | std::ranges::to<std::vector<Eigen::RowVector2d, Eigen::aligned_allocator<Eigen::RowVector2d>>>();
+
+    Eigen::MatrixXd P(face_points.size(), 2);
+    for (std::size_t i = 0; i < face_points.size(); ++i) {
+        const auto& p = all_query_points[face_points[i]];
+        P.row(i) << p.x(), p.y();
+    }
+
+    std::vector<Eigen::VectorXd, Eigen::aligned_allocator<Eigen::VectorXd>> parameters { Eigen::VectorXd(P.rows()), Eigen::VectorXd(P.rows()), Eigen::VectorXd(P.rows()) };
+    std::vector<Eigen::VectorXd, Eigen::aligned_allocator<Eigen::VectorXd>> distances { Eigen::VectorXd(P.rows()), Eigen::VectorXd(P.rows()), Eigen::VectorXd(P.rows()) };
+
+    for (std::size_t i = 0; i < 3; i++) {
+        const auto j = (i + 1) % 3;
+        igl::project_to_line_segment(P, pts[i], pts[j], parameters[i], distances[i]);
+    }
+
+    std::size_t idx = 0;
+    for (std::size_t i = 0; i < face_points.size(); i++) {
+        const auto pid = face_points[i];
+        std::size_t min_idx = 0;
+        double min_dist = distances[0][i];
+        for (std::size_t j = 1; j < 3; j++) {
+            if (distances[j][i] < min_dist) {
+                min_idx = j;
+                min_dist = distances[j][i];
+            }
+        }
+        if (min_dist > sq_tol) {
+            if (idx != i) {
+                face_points[idx] = face_points[i];
+            }
+            idx += 1;
+            continue;
+        }
+
+        const auto next_min_idx = (min_idx + 1) % 3;
+        const auto& pa = pts[min_idx];
+        const auto& pb = pts[next_min_idx];
+        const auto& p = P.row(i);
+        if ((p - pa).squaredNorm() < sq_tol) {
+            point_vertex_indices[pid] = vertices[min_idx];
+            bary_centers(i, min_idx) = 1.0;
+        } else if ((p - pb).squaredNorm() < sq_tol) {
+            point_vertex_indices[pid] = vertices[next_min_idx];
+            bary_centers(i, next_min_idx) = 1.0;
+        } else {
+            const auto eid = mesh.edge(halfedges[min_idx]);
+            edge_points_map[eid].emplace_back(pid);
+            const auto t = parameters[min_idx][i];
+            const auto new_pt = (1.0 - t) * pa + t * pb;
+            all_query_points[pid] = Point_2(new_pt.x(), new_pt.y());
+            bary_centers(i, min_idx) = 1.0 - t;
+            bary_centers(i, next_min_idx) = t;
+        }
+    }
+}
+
+auto add_grid_into_uv_domain(Mesh_2& mesh, const std::size_t grid_dimension, const double edge_length)
+{
+    std::vector<Triangle_2> triangles;
+    triangles.reserve(mesh.number_of_faces());
+    for (const auto fid : mesh.faces()) {
+        const auto h1 = mesh.halfedge(fid);
+        const auto h2 = mesh.next(h1);
+        const auto h3 = mesh.next(h2);
+        triangles.emplace_back(
+            mesh.point(mesh.target(h1)),
+            mesh.point(mesh.target(h2)),
+            mesh.point(mesh.target(h3)));
+    }
+
+    Tree tree(triangles.begin(), triangles.end());
+    tree.accelerate_distance_queries();
+    auto points = generate_grid_points(grid_dimension, edge_length);
+    std::unordered_map<std::size_t, std::vector<std::size_t>> face_points_map(mesh.num_faces());
+    face_points_map.reserve(mesh.num_faces());
+    IVec point_faces(points.size());
+    for (std::size_t i = 0; i < points.size(); ++i) {
+        auto res = tree.closest_point_and_primitive(points[i]);
+        const auto fid = res.second - triangles.begin();
+        point_faces[i] = fid;
+        face_points_map[fid].push_back(i);
+    }
+
+    VMat bary_centers = VMat::Zero(points.size(), 3);
+    std::vector<VI> point_vertex_indices(points.size());
+    std::unordered_map<EI, std::vector<std::size_t>> edge_points_map;
+    const double tol = edge_length / (grid_dimension - 1) * 0.001;
+    for (auto& [fid, face_point_indices] : face_points_map) {
+        locate_points_on_face(mesh, points, FI(fid), face_point_indices, edge_points_map, point_vertex_indices, bary_centers, tol * tol);
+    }
+    const auto a = 2;
+}
+
+} // namespace
 
 int main(int argc, char** argv)
 {
@@ -658,7 +798,7 @@ int main(int argc, char** argv)
     // }
     // fmt::print("Wrote cleaned relief mesh to {}\n", output_path);
 
-    const std::size_t grid_dimension = static_cast<std::size_t>(std::sqrt(relief.number_of_vertices())) - 1;
+    const std::size_t grid_dimension = static_cast<std::size_t>(std::sqrt(relief.number_of_vertices()));
     fmt::print("Estimated grid dimension: {}\n", grid_dimension);
 
     VMat2 V(relief.number_of_vertices(), 2);
@@ -679,6 +819,15 @@ int main(int argc, char** argv)
     auto fv_mat = mesh_to_eigen_mat(patch_points, patch_faces);
     FlattenSurface flatten_surface(std::move(fv_mat.first), std::move(fv_mat.second), segment_offset);
     flatten_surface.slim_solve(10);
-    write_uv("uv1.obj", flatten_surface.uv, flatten_surface.F);
+    std::vector<Point_2> uv_points;
+    uv_points.reserve(flatten_surface.uv.rows());
+    for (std::size_t i = 0; i < flatten_surface.uv.rows(); ++i) {
+        uv_points.emplace_back(flatten_surface.uv(i, 0), flatten_surface.uv(i, 1));
+    }
+    Mesh_2 uv_mesh;
+    PMP::polygon_soup_to_polygon_mesh(uv_points, patch_faces, uv_mesh);
+
+    // write_uv("uv1.obj", flatten_surface.uv, flatten_surface.F);
+    add_grid_into_uv_domain(uv_mesh, grid_dimension, flatten_surface.mean_edge_length);
     return 0;
 }

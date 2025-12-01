@@ -32,6 +32,7 @@ public:
     const std::size_t n_bnd_points;
     const double proximal_p = 0.0001;
     double mesh_area;
+    double mean_edge_length;
     double energy;
 
     Eigen::VectorXd M;
