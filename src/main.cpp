@@ -45,6 +45,7 @@
 #include <ranges>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 using Kernel = CGAL::Exact_predicates_inexact_constructions_kernel;
@@ -81,6 +82,33 @@ struct Bounds {
     Kernel::Point_3 min;
     Kernel::Point_3 max;
 };
+
+auto write_uv1(const std::string& name, const std::vector<Point_2>& uv, const std::vector<std::vector<std::size_t>>& F)
+{
+    std::ofstream file(name);
+    for (Eigen::Index i = 0; i < uv.size(); ++i) {
+        file << "v " << uv[i].x() << " " << uv[i].y() << " 0\n";
+    }
+    for (Eigen::Index i = 0; i < F.size(); ++i) {
+        file << "f " << F[i][0] + 1 << " " << F[i][1] + 1 << " " << F[i][2] + 1 << "\n";
+    }
+    file.close();
+}
+
+auto write_mesh2(const std::string& name, const Mesh_2& mesh) {
+    std::ofstream file(name);
+    for (const auto& point : mesh.points()) {
+        file << "v " << point.x() << " " << point.y() << " " << 0.0 << "\n";
+    }
+    for (const auto fid : mesh.faces()) {
+        file << "f ";
+        for (const auto& vertex : mesh.vertices_around_face(mesh.halfedge(fid))) {
+            file << vertex.idx() + 1 << " ";
+        }
+        file << "\n";
+    }
+    file.close();
+}
 
 std::optional<Bounds> compute_bounds(Mesh& mesh)
 {
@@ -165,11 +193,13 @@ void write_polyline(const std::string& name, const std::vector<gs::SurfacePoint>
     }
     out.close();
 }
+template <typename Point>
 void split_edges(
-    Mesh& mesh,
-    std::unordered_map<Mesh::Edge_index, std::vector<std::size_t>>& edge_points_map,
-    const std::vector<Point_3>& points,
-    std::vector<Mesh::Vertex_index>& point_vertex_indices)
+    CGAL::Surface_mesh<Point>& mesh,
+    std::unordered_map<EI, std::vector<std::size_t>>& edge_points_map,
+    const std::vector<Point>& points,
+    std::vector<VI>& point_vertex_indices,
+    const double tol)
 {
     for (auto& [eid, edge_point_indices] : edge_points_map) {
         if (edge_point_indices.size() == 1) {
@@ -179,7 +209,6 @@ void split_edges(
             mesh.point(new_vid) = points[pid];
             point_vertex_indices[pid] = new_vid;
         } else {
-            constexpr double tol = 0.001;
             auto curr_hid = mesh.halfedge(eid);
             const auto va = mesh.source(curr_hid);
             const auto& pa = mesh.point(va);
@@ -342,6 +371,121 @@ void add_points_on_face(
     }
 }
 
+void add_points_on_face_2d(
+    const FI fid,
+    Mesh_2& mesh,
+    const std::vector<Point_2>& points,
+    const std::vector<std::size_t>& point_indices,
+    const std::size_t n_old_vertices,
+    std::vector<Mesh::Vertex_index>& point_vertex_map,
+    std::vector<std::vector<std::size_t>>& new_faces,
+    VMat& bary_centers
+){
+    std::vector<Mesh::Halfedge_index> halfedges;
+    for (const auto hid : mesh.halfedges_around_face(mesh.halfedge(fid))) {
+        halfedges.emplace_back(hid);
+    }
+    auto vertices = halfedges | std::views::transform([&](const auto hid) {
+        return mesh.source(hid);
+    }) | std::ranges::to<std::vector>();
+    const auto n_face_verts = vertices.size();
+    const auto tri = vertices
+        | std::views::filter([&, n_old_vertices](const auto vid) { return vid.idx() < n_old_vertices; })
+        | std::views::transform([&](const auto vid) { return mesh.point(vid); })
+        | std::ranges::to<std::vector>();
+    for (const auto pid : point_indices) {
+        const auto new_vid = mesh.add_vertex(points[pid]);
+        vertices.emplace_back(new_vid);
+        point_vertex_map[pid] = new_vid;
+    }
+    const auto project = [](const Point_2& p) {
+        return p;
+    };
+    CDT cdt;
+    const auto cdt_vertices = vertices | std::views::transform([&](const auto vid) {
+        CDT::Vertex_handle vhandle = cdt.insert(project(mesh.point(vid)));
+        vhandle->info() = vid;
+        return vhandle;
+    }) | std::ranges::to<std::vector>();
+    std::unordered_map<Mesh::Vertex_index, Mesh::Vertex_index> constrained_vertex_map;
+    for (std::size_t i = 0; i < n_face_verts; i++) {
+        const auto j = (i + 1) % n_face_verts;
+        cdt.insert_constraint(cdt_vertices[i], cdt_vertices[j]);
+        constrained_vertex_map.emplace(vertices[i], vertices[j]);
+    }
+
+    // {
+    //     std::unordered_map<VI, std::size_t> vertex_index_map;
+    //     for (std::size_t i = 0; i < vertices.size(); i++) {
+    //         vertex_index_map[vertices[i]] = i;
+    //     }
+    //     const auto points_2d = vertices | std::views::transform([&](const auto vid) {
+    //         return mesh.point(vid);
+    //     }) | std::ranges::to<std::vector>();
+
+    //     std::vector<std::vector<std::size_t>> face_vertices;
+    //     for (auto face : cdt.finite_face_handles()) {
+    //         const auto v1 = vertex_index_map[face->vertex(0)->info()];
+    //         const auto v2 = vertex_index_map[face->vertex(1)->info()];
+    //         const auto v3 = vertex_index_map[face->vertex(2)->info()];
+    //         face_vertices.push_back(std::vector{v1, v2, v3});
+    //     }
+    //     write_uv1("test.obj", points_2d, face_vertices);
+    // }
+
+    for (auto face : cdt.all_face_handles()) {
+        face->info() = false;
+    }
+    std::vector<CDT::Face_handle> cdt_valid_faces;
+    std::vector<int> bdy_edge_indices;
+    for (auto edge : cdt.constrained_edges()) {
+        const auto va = edge.first->vertex((edge.second + 1) % 3)->info();
+        const auto vb = edge.first->vertex((edge.second + 2) % 3)->info();
+        if (constrained_vertex_map[va] != vb) {
+            edge = cdt.mirror_edge(edge);
+        }
+        cdt.mirror_edge(edge).first->info() = true;
+        auto face = edge.first;
+        auto index = edge.second;
+        if (face->info()) {
+            continue;
+        }
+        face->info() = true;
+        cdt_valid_faces.emplace_back(face);
+        bdy_edge_indices.emplace_back(index);
+    }
+    const auto n_bdy_faces = cdt_valid_faces.size();
+    for (std::size_t i = 0; i < n_bdy_faces; i++) {
+        const auto fh = cdt_valid_faces[i];
+        const auto index = bdy_edge_indices[i];
+        for (int i = 1; i < 3; i++) {
+            auto nei_fh = fh->neighbor((i + index) % 3);
+            if (nei_fh->info() || cdt.is_infinite(nei_fh)) {
+                continue;
+            }
+            nei_fh->info() = true;
+            cdt_valid_faces.emplace_back(nei_fh);
+        }
+    }
+    for (std::size_t i = n_bdy_faces; i < cdt_valid_faces.size(); i++) {
+        const auto fh = cdt_valid_faces[i];
+        for (int i = 0; i < 3; i++) {
+            auto nei_fh = fh->neighbor(i);
+            if (nei_fh->info()) {
+                continue;
+            }
+            nei_fh->info() = true;
+            cdt_valid_faces.emplace_back(nei_fh);
+        }
+    }
+    // CGAL::Euler::remove_face(mesh.halfedge(fid), mesh);
+    for (const auto& fh : cdt_valid_faces) {
+        std::vector<std::size_t> face_vertices { fh->vertex(0)->info().id(), fh->vertex(1)->info().id(), fh->vertex(2)->info().id() };
+        new_faces.emplace_back(std::move(face_vertices));
+        // const auto new_fid = mesh.add_face(face_vertices);
+    }
+}
+
 auto insert_point_into_mesh(
     Mesh& mesh,
     const std::vector<Point_3>& points,
@@ -350,7 +494,7 @@ auto insert_point_into_mesh(
     std::unordered_map<FI, std::vector<std::size_t>> face_points_map)
 {
     const auto n_old_vertices = mesh.number_of_vertices();
-    split_edges(mesh, edge_points_map, points, point_vertex_indices);
+    split_edges(mesh, edge_points_map, points, point_vertex_indices, 0.001);
     for (const auto& [fid, point_indices] : face_points_map) {
         add_points_on_face(fid, mesh, points, point_indices, n_old_vertices, point_vertex_indices);
     }
@@ -711,6 +855,7 @@ void locate_points_on_face(
             bary_centers(i, next_min_idx) = t;
         }
     }
+    face_points.resize(idx);
 }
 
 auto add_grid_into_uv_domain(Mesh_2& mesh, const std::size_t grid_dimension, const double edge_length)
@@ -747,6 +892,39 @@ auto add_grid_into_uv_domain(Mesh_2& mesh, const std::size_t grid_dimension, con
     for (auto& [fid, face_point_indices] : face_points_map) {
         locate_points_on_face(mesh, points, FI(fid), face_point_indices, edge_points_map, point_vertex_indices, bary_centers, tol * tol);
     }
+    const std::size_t n_old_vertices = mesh.number_of_vertices();
+    split_edges(mesh, edge_points_map, points, point_vertex_indices, tol);
+    // write_mesh2("mesh3.obj", mesh);
+    std::vector<std::vector<std::size_t>> new_faces;
+    std::vector<bool> face_is_deleted(mesh.num_faces() + mesh.number_of_removed_faces(), false);
+    for (auto& [fid, face_point_indices] : face_points_map) {
+        if (!face_point_indices.empty()) {
+            face_is_deleted[fid] = false;
+            add_points_on_face_2d(FI(fid), mesh, points, face_point_indices, n_old_vertices, point_vertex_indices, new_faces, bary_centers);
+        }
+    }
+
+    std::vector<Point_2> all_points;
+    std::vector<std::vector<std::size_t>> all_faces;
+    all_points.append_range(mesh.points());
+    for (const auto fid : mesh.faces()) {
+        if (face_is_deleted[fid]) {
+            continue;
+        }
+        const auto h1 = mesh.halfedge(fid);
+        const auto h2 = mesh.next(h1);
+        const auto h3 = mesh.next(h2);
+        const std::size_t v1 = mesh.source(h1);
+        const std::size_t v2 = mesh.source(h2);
+        const std::size_t v3 = mesh.source(h3);
+        all_faces.push_back({v1, v2, v3});
+    }
+    all_faces.append_range(std::move(new_faces));
+    write_uv1("mesh4.obj", all_points, all_faces);
+
+    Mesh_2 new_mesh;
+    PMP::polygon_soup_to_polygon_mesh(all_points, all_faces, new_mesh);
+
     const auto a = 2;
 }
 
