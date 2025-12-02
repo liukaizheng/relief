@@ -30,7 +30,13 @@ CPMAddPackage(
     OPTIONS
         "SUITESPARSE OFF"
 )
-CPMAddPackage("gh:liukaizheng/libigl#main")
+CPMAddPackage(
+    NAME libigl
+    GIT_TAG main
+    GITHUB_REPOSITORY liukaizheng/libigl
+    OPTIONS
+        "LIBIGL_RESTRICTED_TRIANGLE ON"
+)
 
 add_executable(relief_app
     src/flatten_surface.cpp
@@ -44,6 +50,7 @@ target_link_libraries(relief_app PRIVATE
     Eigen3::Eigen
     geometry-central
     igl::core
+    igl_restricted::triangle
 )
 target_include_directories(relief_app PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include

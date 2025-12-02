@@ -35,6 +35,8 @@
 #include <geometrycentral/utilities/vector3.h>
 
 #include <igl/project_to_line_segment.h>
+#include <igl/triangle/triangulate.h>
+#include <igl/barycentric_coordinates.h>
 
 #include "flatten_surface.h"
 
@@ -82,6 +84,18 @@ struct Bounds {
     Kernel::Point_3 min;
     Kernel::Point_3 max;
 };
+
+auto write_uv(const std::string& name, const VMat2& uv, const FMat& F)
+{
+    std::ofstream file(name);
+    for (Eigen::Index i = 0; i < uv.rows(); ++i) {
+        file << "v " << uv(i, 0) << " " << uv(i, 1) << " 0\n";
+    }
+    for (Eigen::Index i = 0; i < F.rows(); ++i) {
+        file << "f " << F(i, 0) + 1 << " " << F(i, 1) + 1 << " " << F(i, 2) + 1 << "\n";
+    }
+    file.close();
+}
 
 auto write_uv1(const std::string& name, const std::vector<Point_2>& uv, const std::vector<std::vector<std::size_t>>& F)
 {
@@ -368,6 +382,69 @@ void add_points_on_face(
         if (!new_fid.is_valid()) {
             std::cout << "failed to add faces\n";
         }
+    }
+}
+
+void triangualte_on_face(
+    const Mesh_2& mesh,
+    const FI fid,
+    std::vector<Point_2>& points,
+    const std::vector<Point_2>& face_points,
+    const std::vector<std::size_t>& face_point_indices,
+    std::vector<VI>& point_vertex_indices,
+    std::vector<std::vector<std::size_t>>& new_faces,
+    const FMat& F,
+    VMat& baray_center
+) {
+    std::vector<std::size_t> vertices;
+    for (const auto vid : mesh.vertices_around_face(mesh.halfedge(fid))) {
+        vertices.emplace_back(vid.id());
+    }
+    const auto n_old_vertices = vertices.size();
+    for (const auto pid : face_point_indices) {
+        const auto vid = points.size();
+        points.emplace_back(face_points[pid]);
+        point_vertex_indices[pid] = VI(vid);
+        vertices.emplace_back(vid);
+    }
+
+    VMat2 V(vertices.size(), 2);
+    for (std::size_t i = 0; i < vertices.size(); ++i) {
+        const auto vid = vertices[i];
+        const auto& point = points[vid];
+        V.row(i) << point.x(), point.y();
+    }
+
+    EMat E(n_old_vertices, 2);
+    for (std::size_t i = 0; i < n_old_vertices; ++i) {
+        E.row(i) << i, (i + 1) % n_old_vertices;
+    }
+
+    VMat2 H;
+    VMat2 WV;
+    FMat WF;
+    igl::triangle::triangulate(V, E, H,"Q", WV, WF);
+    for (Eigen::Index i = 0; i < WF.rows(); i++) {
+        std::vector<std::size_t> face;
+        for (Eigen::Index j = 0; j < 3; j++) {
+            const auto vid = vertices[WF(i, j)];
+            face.emplace_back(vid);
+        }
+        const auto find1 = std::ranges::find(face, 359) != face.end();
+        const auto find2 = std::ranges::find(face, 172) != face.end();
+        new_faces.emplace_back(std::move(face));
+    }
+
+    if (!face_point_indices.empty()) {
+        const auto fv = F.row(fid.id());
+        Eigen::RowVector2d p1(points[fv[0]].x(), points[fv[0]].y());
+        Eigen::RowVector2d p2(points[fv[1]].x(), points[fv[1]].y());
+        Eigen::RowVector2d p3(points[fv[2]].x(), points[fv[2]].y());
+
+        auto I = IVec::LinSpaced(face_point_indices.size(), n_old_vertices, vertices.size()- 1).eval();
+        Eigen::MatrixXd B;
+        igl::barycentric_coordinates(V(I, Eigen::placeholders::all), p1.replicate(I.size(), 1), p2.replicate(I.size(), 1), p3.replicate(I.size(), 1), B);
+        baray_center(face_point_indices, Eigen::placeholders::all) = B;
     }
 }
 
@@ -757,18 +834,6 @@ auto mesh_to_eigen_mat(const std::vector<Point_3>& points, std::vector<std::vect
     return std::make_pair(std::move(V), std::move(F));
 }
 
-auto write_uv(const std::string& name, const VMat2& uv, const FMat& F)
-{
-    std::ofstream file(name);
-    for (Eigen::Index i = 0; i < uv.rows(); ++i) {
-        file << "v " << uv(i, 0) << " " << uv(i, 1) << " 0\n";
-    }
-    for (Eigen::Index i = 0; i < F.rows(); ++i) {
-        file << "f " << F(i, 0) + 1 << " " << F(i, 1) + 1 << " " << F(i, 2) + 1 << "\n";
-    }
-    file.close();
-}
-
 auto generate_grid_points(const std::size_t grid_dimension, const double edge_length)
 {
     const auto X = Eigen::VectorXd::LinSpaced(grid_dimension, 0.0, edge_length).eval();
@@ -841,18 +906,18 @@ void locate_points_on_face(
         const auto& p = P.row(i);
         if ((p - pa).squaredNorm() < sq_tol) {
             point_vertex_indices[pid] = vertices[min_idx];
-            bary_centers(i, min_idx) = 1.0;
+            bary_centers(pid, min_idx) = 1.0;
         } else if ((p - pb).squaredNorm() < sq_tol) {
             point_vertex_indices[pid] = vertices[next_min_idx];
-            bary_centers(i, next_min_idx) = 1.0;
+            bary_centers(pid, next_min_idx) = 1.0;
         } else {
             const auto eid = mesh.edge(halfedges[min_idx]);
             edge_points_map[eid].emplace_back(pid);
             const auto t = parameters[min_idx][i];
             const auto new_pt = (1.0 - t) * pa + t * pb;
             all_query_points[pid] = Point_2(new_pt.x(), new_pt.y());
-            bary_centers(i, min_idx) = 1.0 - t;
-            bary_centers(i, next_min_idx) = t;
+            bary_centers(pid, min_idx) = 1.0 - t;
+            bary_centers(pid, next_min_idx) = t;
         }
     }
     face_points.resize(idx);
@@ -893,39 +958,35 @@ auto add_grid_into_uv_domain(Mesh_2& mesh, const std::size_t grid_dimension, con
         locate_points_on_face(mesh, points, FI(fid), face_point_indices, edge_points_map, point_vertex_indices, bary_centers, tol * tol);
     }
     const std::size_t n_old_vertices = mesh.number_of_vertices();
-    split_edges(mesh, edge_points_map, points, point_vertex_indices, tol);
-    // write_mesh2("mesh3.obj", mesh);
-    std::vector<std::vector<std::size_t>> new_faces;
-    std::vector<bool> face_is_deleted(mesh.num_faces() + mesh.number_of_removed_faces(), false);
-    for (auto& [fid, face_point_indices] : face_points_map) {
-        if (!face_point_indices.empty()) {
-            face_is_deleted[fid] = false;
-            add_points_on_face_2d(FI(fid), mesh, points, face_point_indices, n_old_vertices, point_vertex_indices, new_faces, bary_centers);
-        }
-    }
-
-    std::vector<Point_2> all_points;
-    std::vector<std::vector<std::size_t>> all_faces;
-    all_points.append_range(mesh.points());
+    FMat F(mesh.number_of_faces(), 3);
     for (const auto fid : mesh.faces()) {
-        if (face_is_deleted[fid]) {
-            continue;
-        }
         const auto h1 = mesh.halfedge(fid);
         const auto h2 = mesh.next(h1);
         const auto h3 = mesh.next(h2);
-        const std::size_t v1 = mesh.source(h1);
-        const std::size_t v2 = mesh.source(h2);
-        const std::size_t v3 = mesh.source(h3);
-        all_faces.push_back({v1, v2, v3});
+
+        F.row(fid.id()) << mesh.source(h1).id(), mesh.source(h2).id(), mesh.source(h3).id();
     }
-    all_faces.append_range(std::move(new_faces));
-    write_uv1("mesh4.obj", all_points, all_faces);
 
-    Mesh_2 new_mesh;
-    PMP::polygon_soup_to_polygon_mesh(all_points, all_faces, new_mesh);
+    split_edges(mesh, edge_points_map, points, point_vertex_indices, tol);
+    std::vector<std::vector<std::size_t>> new_faces;
+    std::vector<Point_2> mesh_points;
+    mesh_points.append_range(mesh.points());
+    for (const auto fid : mesh.faces()) {
+        const auto it = face_points_map.find(fid);
+        if(it == face_points_map.end()) {
+            triangualte_on_face(mesh, FI(fid), mesh_points, points,{}, point_vertex_indices, new_faces, F, bary_centers);
+        } else {
+            triangualte_on_face(mesh, FI(fid), mesh_points, points, it->second, point_vertex_indices, new_faces, F, bary_centers);
+        }
+    }
 
-    const auto a = 2;
+    const auto error = (bary_centers.rowwise().sum().array() - 1.00).abs().maxCoeff();
+    if (error > 1e-3) {
+        fmt::println(stderr, "Barycenter error: {}", error);
+    }
+
+    // Mesh_2 new_mesh;
+    // PMP::polygon_soup_to_polygon_mesh(mesh_points, new_faces, new_mesh);
 }
 
 } // namespace
