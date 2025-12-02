@@ -34,9 +34,10 @@
 #include <geometrycentral/utilities/vector2.h>
 #include <geometrycentral/utilities/vector3.h>
 
+#include <igl/barycentric_coordinates.h>
 #include <igl/project_to_line_segment.h>
 #include <igl/triangle/triangulate.h>
-#include <igl/barycentric_coordinates.h>
+#include <igl/per_face_normals.h>
 
 #include "flatten_surface.h"
 
@@ -109,7 +110,8 @@ auto write_uv1(const std::string& name, const std::vector<Point_2>& uv, const st
     file.close();
 }
 
-auto write_mesh2(const std::string& name, const Mesh_2& mesh) {
+auto write_mesh2(const std::string& name, const Mesh_2& mesh)
+{
     std::ofstream file(name);
     for (const auto& point : mesh.points()) {
         file << "v " << point.x() << " " << point.y() << " " << 0.0 << "\n";
@@ -394,8 +396,8 @@ void triangualte_on_face(
     std::vector<VI>& point_vertex_indices,
     std::vector<std::vector<std::size_t>>& new_faces,
     const FMat& F,
-    VMat& baray_center
-) {
+    VMat& baray_center)
+{
     std::vector<std::size_t> vertices;
     for (const auto vid : mesh.vertices_around_face(mesh.halfedge(fid))) {
         vertices.emplace_back(vid.id());
@@ -423,7 +425,7 @@ void triangualte_on_face(
     VMat2 H;
     VMat2 WV;
     FMat WF;
-    igl::triangle::triangulate(V, E, H,"Q", WV, WF);
+    igl::triangle::triangulate(V, E, H, "Q", WV, WF);
     for (Eigen::Index i = 0; i < WF.rows(); i++) {
         std::vector<std::size_t> face;
         for (Eigen::Index j = 0; j < 3; j++) {
@@ -441,7 +443,7 @@ void triangualte_on_face(
         Eigen::RowVector2d p2(points[fv[1]].x(), points[fv[1]].y());
         Eigen::RowVector2d p3(points[fv[2]].x(), points[fv[2]].y());
 
-        auto I = IVec::LinSpaced(face_point_indices.size(), n_old_vertices, vertices.size()- 1).eval();
+        auto I = IVec::LinSpaced(face_point_indices.size(), n_old_vertices, vertices.size() - 1).eval();
         Eigen::MatrixXd B;
         igl::barycentric_coordinates(V(I, Eigen::placeholders::all), p1.replicate(I.size(), 1), p2.replicate(I.size(), 1), p3.replicate(I.size(), 1), B);
         baray_center(face_point_indices, Eigen::placeholders::all) = B;
@@ -456,8 +458,8 @@ void add_points_on_face_2d(
     const std::size_t n_old_vertices,
     std::vector<Mesh::Vertex_index>& point_vertex_map,
     std::vector<std::vector<std::size_t>>& new_faces,
-    VMat& bary_centers
-){
+    VMat& bary_centers)
+{
     std::vector<Mesh::Halfedge_index> halfedges;
     for (const auto hid : mesh.halfedges_around_face(mesh.halfedge(fid))) {
         halfedges.emplace_back(hid);
@@ -973,8 +975,8 @@ auto add_grid_into_uv_domain(Mesh_2& mesh, const std::size_t grid_dimension, con
     mesh_points.append_range(mesh.points());
     for (const auto fid : mesh.faces()) {
         const auto it = face_points_map.find(fid);
-        if(it == face_points_map.end()) {
-            triangualte_on_face(mesh, FI(fid), mesh_points, points,{}, point_vertex_indices, new_faces, F, bary_centers);
+        if (it == face_points_map.end()) {
+            triangualte_on_face(mesh, FI(fid), mesh_points, points, {}, point_vertex_indices, new_faces, F, bary_centers);
         } else {
             triangualte_on_face(mesh, FI(fid), mesh_points, points, it->second, point_vertex_indices, new_faces, F, bary_centers);
         }
@@ -985,8 +987,142 @@ auto add_grid_into_uv_domain(Mesh_2& mesh, const std::size_t grid_dimension, con
         fmt::println(stderr, "Barycenter error: {}", error);
     }
 
+    return std::make_tuple(std::move(mesh_points), std::move(new_faces), std::move(point_faces), std::move(point_vertex_indices), std::move(F), std::move(bary_centers));
+
     // Mesh_2 new_mesh;
     // PMP::polygon_soup_to_polygon_mesh(mesh_points, new_faces, new_mesh);
+}
+
+auto get_height_mat(Mesh& mesh, const Point_3& min_pt, const std::size_t grid_dimension, const double stride)
+{
+    Eigen::MatrixXd height_mat = Eigen::MatrixXd::Constant(grid_dimension, grid_dimension, std::numeric_limits<double>::quiet_NaN());
+    MatXu index_mat = MatXu::Zero(grid_dimension, grid_dimension);
+    for (const auto vid : mesh.vertices()) {
+        const auto& pt = mesh.point(vid);
+        const auto x = static_cast<std::size_t>(std::round((pt.x() - min_pt.x()) / stride));
+        const auto y = static_cast<std::size_t>(std::round((pt.y() - min_pt.y()) / stride));
+        if (x < grid_dimension && y < grid_dimension) {
+            height_mat(x, y) = pt.z();
+            index_mat(x, y) = vid.id();
+        } else {
+            fmt::println(stderr, "Point out of bounds: ({}, {}, {})", pt.x(), pt.y(), pt.z());
+        }
+    }
+    const auto not_nan = height_mat.cwiseNotEqual(std::numeric_limits<double>::quiet_NaN()).all();
+    if (!not_nan) {
+        fmt::println(stderr, "Mesh contains NaN values");
+    }
+    return std::make_pair(std::move(height_mat), std::move(index_mat));
+}
+
+auto build_relief_base(const std::vector<Point_3>& points, const std::size_t n_points, const IVec& point_faces, FMat& F, VMat& B, std::vector<VI>& point_vertex_indices) {
+    std::vector<Point_3> result = points;
+    result.resize(n_points);
+    for (Eigen::Index i = 0; i < B.rows(); i++) {
+        const auto vid = point_vertex_indices[i].id();
+        if (vid < points.size()) {
+            continue;
+        }
+        const auto f = F.row(point_faces[i]);
+        const auto& pa = points[f[0]];
+        const auto& pb = points[f[1]];
+        const auto& pc = points[f[2]];
+        const double a = B(i, 0);
+        const double b = B(i, 1);
+        const double c = B(i, 2);
+
+        result[vid] = Point_3(a * pa.x() + b * pb.x() + c * pc.x(),
+                              a * pa.y() + b * pb.y() + c * pc.y(),
+                              a * pa.z() + b * pb.z() + c * pc.z());
+    }
+    return result;
+}
+
+void build_relief_top(
+    Mesh& mesh,
+    const std::vector<Point_3>& points,
+    const IVec& point_faces,
+    Eigen::MatrixXd& height_mat,
+    MatXu& index_mat,
+    VMat& N,
+    const std::vector<VI>& point_vertex_indices
+) {
+    // std::vector<Point_3> result(height_mat.size());
+    for (Eigen::Index i = 0; i <  point_faces.size(); i++) {
+        auto r = i / height_mat.cols();
+        auto c = i % height_mat.cols();
+        auto h = height_mat(r, c);
+        const auto vid = point_vertex_indices[i];
+        const auto fid = point_faces[i];
+        const auto& base_pt = points[vid];
+        const auto& normal = N.row(fid);
+
+        auto idx = index_mat(r, c);
+        mesh.point(VI(idx)) = Point_3(base_pt.x() + h * normal(0),
+                              base_pt.y() + h * normal(1),
+                              base_pt.z() + h * normal(2));
+    }
+}
+auto get_base_boundary(const Mesh& mesh, const std::size_t grid_dimension, const std::vector<VI>& point_vertex_indices) {
+    std::vector<VI> vertices;
+    vertices.reserve(grid_dimension * 4);
+    const auto add_vertex = [&](std::size_t r, std::size_t c) {
+        vertices.emplace_back(point_vertex_indices[grid_dimension * c + r]);
+    };
+    for (std::size_t i = 0; i < grid_dimension; i++) {
+        add_vertex(i, 0);
+    }
+    for (std::size_t i = 0; i < grid_dimension; i++) {
+        add_vertex(grid_dimension, i);
+    }
+    for (std::size_t i = 0; i < grid_dimension; i++) {
+        add_vertex(grid_dimension - i, grid_dimension);
+    }
+    for (std::size_t i = 0; i < grid_dimension; i++) {
+        add_vertex(0, grid_dimension - i);
+    }
+    vertices.emplace_back(vertices.back());
+
+    auto hid = mesh.halfedge(vertices[0]);
+    std::vector<HI> halfedges{};
+    std::vector<std::size_t> separators{0};
+    std::size_t i = 1;
+    auto vb = vertices[i];
+    while (i < vertices.size()) {
+        const auto oppo_hid = mesh.opposite(hid);
+        halfedges.emplace_back(oppo_hid);
+        const auto vid = mesh.target(oppo_hid);
+        hid = mesh.prev(hid);
+        if (vid == vb) {
+            separators.emplace_back(halfedges.size());
+            i += 1;
+            if (i < vertices.size()) {
+                vb = vertices[i];
+            }
+        }
+    }
+    const auto a = 2;
+}
+
+auto get_top_boundary(const std::size_t grid_dimensioin, const MatXu& index_mat) {
+    std::vector<VI> vertices;
+    vertices.resize(grid_dimensioin * 4);
+    const auto add_vertex = [&](std::size_t r, std::size_t c) {
+        vertices.emplace_back(index_mat(r, c));
+    };
+    for (std::size_t i = 0; i < grid_dimensioin; i++) {
+        add_vertex(i, 0);
+    }
+    for (std::size_t i = 0; i < grid_dimensioin; i++) {
+        add_vertex(grid_dimensioin, i);
+    }
+    for (std::size_t i = 0; i < grid_dimensioin; i++) {
+        add_vertex(grid_dimensioin - i, grid_dimensioin);
+    }
+    for (std::size_t i = 0; i < grid_dimensioin; i++) {
+        add_vertex(0, grid_dimensioin - i);
+    }
+    return vertices;
 }
 
 } // namespace
@@ -1040,17 +1176,13 @@ int main(int argc, char** argv)
     const std::size_t grid_dimension = static_cast<std::size_t>(std::sqrt(relief.number_of_vertices()));
     fmt::print("Estimated grid dimension: {}\n", grid_dimension);
 
-    VMat2 V(relief.number_of_vertices(), 2);
-    std::size_t idx = 0;
-    for (const auto& pt : relief.points()) {
-        V.row(idx++) << pt.x(), pt.y();
-    }
-    auto min_pt = V.colwise().minCoeff().transpose().eval();
-    auto max_pt = V.colwise().maxCoeff().transpose().eval();
-    fmt::println("Min point: ({}, {})", min_pt.x(), min_pt.y());
-    fmt::println("Max point: ({}, {})", max_pt.x(), max_pt.y());
+    const double scale = 0.02;
+    auto [height_mat, index_mat] = get_height_mat(relief, bounds->min, grid_dimension, (bounds->max.x() - bounds->min.x()) / (grid_dimension - 1));
+    height_mat = (height_mat.array() - min_z) * scale;
 
-    scale_box(min_pt, max_pt, 0.02);
+    Eigen::Vector2d min_pt(bounds->min.x(), bounds->min.y());
+    Eigen::Vector2d max_pt(bounds->max.x(), bounds->max.y());
+    scale_box(min_pt, max_pt, scale);
     auto [mesh, boundary_halfedges, segment_offset] = embed_planar_grid_boundary(mesh_path, min_pt, max_pt, 16, grid_dimension);
     const auto faces = surround_faces(mesh, boundary_halfedges);
     auto [patch_points, patch_vertices, patch_faces] = extract_faces(mesh, faces, boundary_halfedges);
@@ -1058,6 +1190,10 @@ int main(int argc, char** argv)
     auto fv_mat = mesh_to_eigen_mat(patch_points, patch_faces);
     FlattenSurface flatten_surface(std::move(fv_mat.first), std::move(fv_mat.second), segment_offset);
     flatten_surface.slim_solve(10);
+
+    VMat N;
+    igl::per_face_normals(flatten_surface.V, flatten_surface.F, N);
+
     std::vector<Point_2> uv_points;
     uv_points.reserve(flatten_surface.uv.rows());
     for (std::size_t i = 0; i < flatten_surface.uv.rows(); ++i) {
@@ -1067,6 +1203,20 @@ int main(int argc, char** argv)
     PMP::polygon_soup_to_polygon_mesh(uv_points, patch_faces, uv_mesh);
 
     // write_uv("uv1.obj", flatten_surface.uv, flatten_surface.F);
-    add_grid_into_uv_domain(uv_mesh, grid_dimension, flatten_surface.mean_edge_length);
+    auto [
+        relief_base_uvs, relief_base_faces, point_faces, grid_point_vertex_indices, path_face_vertices, bary_centers
+    ] = add_grid_into_uv_domain(uv_mesh, grid_dimension, flatten_surface.mean_edge_length);
+    auto relief_base_points = build_relief_base(patch_points, relief_base_uvs.size(), point_faces, path_face_vertices, bary_centers, grid_point_vertex_indices);
+    // CGAL::IO::write_polygon_soup("mesh2.obj", relief_base_points, relief_base_faces);
+
+    Mesh base_relief_mesh;
+    PMP::polygon_soup_to_polygon_mesh(relief_base_points, relief_base_faces, base_relief_mesh);
+
+    build_relief_top(relief, relief_base_points, point_faces, height_mat, index_mat, N, grid_point_vertex_indices);
+
+    get_base_boundary(base_relief_mesh, grid_dimension, grid_point_vertex_indices);
+    const auto base_outline = get_top_boundary(grid_dimension, index_mat);
+    CGAL::IO::write_polygon_mesh("mesh3.obj", relief);
+
     return 0;
 }
