@@ -607,8 +607,8 @@ auto trace_bounding_box_outline(const std::string& mesh_path, Eigen::Vector2d bo
     PMP::polygon_soup_to_polygon_mesh(points, faces, mesh);
     const auto sample_stride = 1.0 / samples_per_edge;
 
-    gs::SurfacePoint geodesic_seed_vertex(gmesh->vertex(7008));
-    // gs::SurfacePoint geodesic_seed_vertex(gmesh->vertex(6714));
+    // gs::SurfacePoint geodesic_seed_vertex(gmesh->vertex(7008));
+    gs::SurfacePoint geodesic_seed_vertex(gmesh->vertex(6714));
     const auto bounding_box_center = ((bounding_min + bounding_max) * 0.5).eval();
     std::vector<Eigen::Vector2d, Eigen::aligned_allocator<Eigen::Vector2d>> bounding_box_corners { bounding_min, { bounding_max.x(), bounding_min.y() }, bounding_max, { bounding_min.x(), bounding_max.y() } };
     std::vector<Point_3> outline_points;
@@ -632,6 +632,7 @@ auto trace_bounding_box_outline(const std::string& mesh_path, Eigen::Vector2d bo
     }
 
     insert_point_into_mesh(mesh, outline_points, outline_vertex_indices, outline_edge_points_map, outline_face_points_map);
+    // CGAL::IO::write_polygon_mesh("mesh1.obj", mesh);
     return std::make_pair(std::move(outline_vertex_indices), std::move(mesh));
 }
 auto split_face_and_return_edge(
@@ -729,7 +730,7 @@ auto embed_planar_grid_boundary(const std::string& input_mesh_path, const Eigen:
     //     temp.emplace_back(boundary_segments[j].front());
     //     write_polyline(fmt::format("outline_{}.obj", i), temp, gc_geometry->vertexPositions);
     // }
-    // CGAL::IO::write_polygon_mesh("mesh1.obj", cgal_mesh);
+    // CGAL::IO::write_polygon_mesh("mesh2.obj", cgal_mesh);
 
     std::vector<Point_3> new_vertex_positions;
     std::vector<VI> new_boundary_indices;
@@ -1183,7 +1184,7 @@ int main(int argc, char** argv)
     Eigen::Vector2d min_pt(bounds->min.x(), bounds->min.y());
     Eigen::Vector2d max_pt(bounds->max.x(), bounds->max.y());
     scale_box(min_pt, max_pt, scale);
-    auto [mesh, boundary_halfedges, segment_offset] = embed_planar_grid_boundary(mesh_path, min_pt, max_pt, 16, grid_dimension);
+    auto [mesh, boundary_halfedges, segment_offset] = embed_planar_grid_boundary(mesh_path, min_pt, max_pt, 8, grid_dimension);
     const auto faces = surround_faces(mesh, boundary_halfedges);
     auto [patch_points, patch_vertices, patch_faces] = extract_faces(mesh, faces, boundary_halfedges);
 
@@ -1202,7 +1203,7 @@ int main(int argc, char** argv)
     Mesh_2 uv_mesh;
     PMP::polygon_soup_to_polygon_mesh(uv_points, patch_faces, uv_mesh);
 
-    // write_uv("uv1.obj", flatten_surface.uv, flatten_surface.F);
+    write_uv("uv1.obj", flatten_surface.uv, flatten_surface.F);
     auto [
         relief_base_uvs, relief_base_faces, point_faces, grid_point_vertex_indices, path_face_vertices, bary_centers
     ] = add_grid_into_uv_domain(uv_mesh, grid_dimension, flatten_surface.mean_edge_length);
@@ -1213,10 +1214,10 @@ int main(int argc, char** argv)
     PMP::polygon_soup_to_polygon_mesh(relief_base_points, relief_base_faces, base_relief_mesh);
 
     build_relief_top(relief, relief_base_points, point_faces, height_mat, index_mat, N, grid_point_vertex_indices);
+    CGAL::IO::write_polygon_mesh("mesh3.obj", relief);
 
     get_base_boundary(base_relief_mesh, grid_dimension, grid_point_vertex_indices);
     const auto base_outline = get_top_boundary(grid_dimension, index_mat);
-    CGAL::IO::write_polygon_mesh("mesh3.obj", relief);
 
     return 0;
 }
