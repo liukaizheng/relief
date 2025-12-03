@@ -20,28 +20,42 @@ auto write_uv(const std::string& name, const VMat2& uv, const FMat& F) {
 
 template<typename DerivedV1, typename DerivedV2, typename DerivedN>
 void cross(const Eigen::MatrixBase<DerivedV1>& V1, const Eigen::MatrixBase<DerivedV2>& V2, Eigen::MatrixBase<DerivedN>& N) {
-    N.col(0) = V1.col(1) * V2.col(2) - V1.col(2) * V2.col(1);
-    N.col(1) = V1.col(2) * V2.col(0) - V1.col(0) * V2.col(2);
-    N.col(2) = V1.col(0) * V2.col(1) - V1.col(1) * V2.col(0);
+    N.col(0) = V1.col(1).cwiseProduct(V2.col(2)) - V1.col(2).cwiseProduct(V2.col(1));
+    N.col(1) = V1.col(2).cwiseProduct(V2.col(0)) - V1.col(0).cwiseProduct(V2.col(2));
+    N.col(2) = V1.col(0).cwiseProduct(V2.col(1)) - V1.col(1).cwiseProduct(V2.col(0));
 }
 
 template<typename DerivedV, typename DerivedF>
 auto grad_tri(const Eigen::MatrixBase<DerivedV>& V, const Eigen::MatrixBase<DerivedF>& F) {
     const auto n_faces = F.rows();
     const auto n_verties = V.rows();
-    Eigen::SparseMatrix<typename DerivedV::Scalar> result(n_faces * 3, n_verties);
     auto V1 = V(F.col(2), Eigen::placeholders::all) - V(F.col(1), Eigen::placeholders::all);
     auto V2 = V(F.col(0), Eigen::placeholders::all) - V(F.col(2), Eigen::placeholders::all);
     using Mat = Eigen::Matrix<typename DerivedV::Scalar, Eigen::Dynamic, 3>;
     Mat N(n_faces, 3);
     cross(V1, V2, N);
-    auto DA = N.rowwise().norm(); // double area
+    auto DA = N.rowwise().norm().eval(); // double area
 
     N = N.array() / DA.replicate(1, 3).array();
     Mat PV1(n_faces, 3);
     cross(N, V1, PV1);
     Mat PV2(n_faces, 3);
     cross(N, V2, PV2);
+    Eigen::SparseMatrix<typename DerivedV::Scalar> result(n_faces * 3, n_verties);
+    std::vector<Eigen::Triplet<typename DerivedV::Scalar>> triplets;
+    for (Eigen::Index i = 0; i < n_faces; ++i) {
+        const auto idx = i * 3;
+        for (Eigen::Index j = 0; j < 3; j++) {
+            triplets.emplace_back(idx + j, F(i, 0), PV1(i, j));
+            triplets.emplace_back(idx + j, F(i, 2), -PV1(i, j));
+            triplets.emplace_back(idx + j, F(i, 1), PV2(i, j));
+            triplets.emplace_back(idx + j, F(i, 2), -PV1(i, j));
+
+        }
+
+    }
+    result.setFromTriplets(triplets.begin(), triplets.end());
+    return result;
 }
 
 FlattenSurface::FlattenSurface(VMat&& V, FMat&& F, const std::vector<std::size_t>& segment_offsets) noexcept : V(std::move(V)), F(std::move(F)), n_bnd_points(segment_offsets.back()) {
