@@ -18,6 +18,19 @@ auto write_uv(const std::string& name, const VMat2& uv, const FMat& F) {
     file.close();
 }
 
+template<typename S>
+void print_sparse_mat(const Eigen::SparseMatrix<S>& mat, const std::size_t n_max) {
+    std::size_t idx = 0;
+    for (Eigen::Index i = 0; i < mat.outerSize(); i++) {
+        for (typename Eigen::SparseMatrix<S>::InnerIterator it(mat, i); it; ++it) {
+            std::cout << "(" << it.row() << ", " << it.col() << ") = " << it.value() << std::endl;
+            if (++idx > n_max) {
+                return;
+            }
+        }
+    }
+}
+
 template<typename DerivedV1, typename DerivedV2, typename DerivedN>
 void cross(const Eigen::MatrixBase<DerivedV1>& V1, const Eigen::MatrixBase<DerivedV2>& V2, Eigen::MatrixBase<DerivedN>& N) {
     N.col(0) = V1.col(1).cwiseProduct(V2.col(2)) - V1.col(2).cwiseProduct(V2.col(1));
@@ -29,33 +42,61 @@ template<typename DerivedV, typename DerivedF>
 auto grad_tri(const Eigen::MatrixBase<DerivedV>& V, const Eigen::MatrixBase<DerivedF>& F) {
     const auto n_faces = F.rows();
     const auto n_verties = V.rows();
-    auto V1 = V(F.col(2), Eigen::placeholders::all) - V(F.col(1), Eigen::placeholders::all);
+    auto V1 = (V(F.col(2), Eigen::placeholders::all) - V(F.col(1), Eigen::placeholders::all)).eval();
     auto V2 = V(F.col(0), Eigen::placeholders::all) - V(F.col(2), Eigen::placeholders::all);
     using Mat = Eigen::Matrix<typename DerivedV::Scalar, Eigen::Dynamic, 3>;
     Mat N(n_faces, 3);
     cross(V1, V2, N);
     auto DA = N.rowwise().norm().eval(); // double area
+    auto DA_M = DA.replicate(1, 3).array();
+    N = N.array() / DA_M;
 
-    N = N.array() / DA.replicate(1, 3).array();
     Mat PV1(n_faces, 3);
     cross(N, V1, PV1);
+    PV1 = PV1.array() / DA_M;
+
     Mat PV2(n_faces, 3);
     cross(N, V2, PV2);
-    Eigen::SparseMatrix<typename DerivedV::Scalar> result(n_faces * 3, n_verties);
-    std::vector<Eigen::Triplet<typename DerivedV::Scalar>> triplets;
-    for (Eigen::Index i = 0; i < n_faces; ++i) {
-        const auto idx = i * 3;
-        for (Eigen::Index j = 0; j < 3; j++) {
-            triplets.emplace_back(idx + j, F(i, 0), PV1(i, j));
-            triplets.emplace_back(idx + j, F(i, 2), -PV1(i, j));
-            triplets.emplace_back(idx + j, F(i, 1), PV2(i, j));
-            triplets.emplace_back(idx + j, F(i, 2), -PV1(i, j));
+    PV2 = PV2.array() / DA_M;
 
-        }
+    // auto V3 = (V(F.col(1), Eigen::placeholders::all) - V(F.col(0), Eigen::placeholders::all)).eval();
+    // Mat PV3(n_faces, 3);
+    // cross(N, V3, PV3);
+    // PV3 = PV3.array() / DA_M;
 
+    Eigen::SparseMatrix<Eigen::Index> IFV(n_faces, n_verties);
+    std::vector<Eigen::Triplet<Eigen::Index>> triplets;
+    Eigen::Index idx = 0;
+    for (Eigen::Index i = 0; i < n_faces; i++) {
+        triplets.emplace_back(i, F(i, 0), idx++);
+        triplets.emplace_back(i, F(i, 1), idx++);
+        triplets.emplace_back(i, F(i, 2), idx++);
     }
-    result.setFromTriplets(triplets.begin(), triplets.end());
-    return result;
+    IFV.setFromTriplets(triplets.begin(), triplets.end());
+    IFV.makeCompressed();
+
+    IVec I = IVec::LinSpaced(n_faces, 0, n_faces * 3 - 3);
+    Mat G(n_faces * 3, 3);
+    G(I, Eigen::placeholders::all) = PV1;
+    G(I.array() + 1, Eigen::placeholders::all) = PV2;
+    G(I.array() + 2, Eigen::placeholders::all) = -PV1 - PV2;
+
+
+    // Eigen::SparseMatrix<typename DerivedV::Scalar> G(n_faces * 3, n_verties);
+    // std::vector<Eigen::Triplet<typename DerivedV::Scalar>> triplets;
+    // for (Eigen::Index i = 0; i < n_faces; ++i) {
+    //     const auto idx = i * 3;
+    //     for (Eigen::Index j = 0; j < 3; j++) {
+    //         triplets.emplace_back(idx + j, F(i, 0), PV1(i, j));
+    //         triplets.emplace_back(idx + j, F(i, 2), -PV1(i, j));
+    //         triplets.emplace_back(idx + j, F(i, 1), PV2(i, j));
+    //         triplets.emplace_back(idx + j, F(i, 2), -PV2(i, j));
+
+    //     }
+
+    // }
+    // G.setFromTriplets(triplets.begin(), triplets.end());
+    return std::make_tuple(std::move(V1), std::move(PV1), std::move(N), std::move(DA), std::move(IFV), std::move(G));
 }
 
 FlattenSurface::FlattenSurface(VMat&& V, FMat&& F, const std::vector<std::size_t>& segment_offsets) noexcept : V(std::move(V)), F(std::move(F)), n_bnd_points(segment_offsets.back()) {
@@ -119,8 +160,31 @@ FlattenSurface::FlattenSurface(VMat&& V, FMat&& F, const std::vector<std::size_t
 }
 
 void FlattenSurface::slim_solve(const std::size_t n_iterations) {
-    grad_tri(this->V, this->F);
     pre_calc();
+    {
+        auto [B1, B2, N, DA, IFV, G] = grad_tri(this->V, this->F);
+
+        auto get_derivate = [&](const Eigen::Matrix<double, Eigen::Dynamic, 3>& B, SpMat& D) noexcept {
+            auto values = D.valuePtr();
+            const auto outer_indices = D.outerIndexPtr();
+            const auto inner_indices = D.innerIndexPtr();
+            for (Eigen::Index i = 0; i < D.outerSize(); i++) {
+                const auto start = outer_indices[i];
+                const auto end = outer_indices[i + 1];
+                const auto size = end - start;
+                Eigen::Matrix<decltype(IFV)::Scalar, Eigen::Dynamic, 1>::ConstMapType I1(IFV.valuePtr() + start, size);
+                Eigen::Matrix<std::remove_pointer_t<decltype(inner_indices)>, Eigen::Dynamic, 1>::ConstMapType I2(inner_indices + start, size);
+                Eigen::VectorXd::MapType(values + start, size) = (G(I1, Eigen::placeholders::all).array() * B(I2, Eigen::placeholders::all).array()).rowwise().sum();
+            }
+        };
+
+        SpMat DX = SpMat::Map(IFV.rows(), IFV.cols(), IFV.nonZeros(), IFV.outerIndexPtr(), IFV.innerIndexPtr(), std::vector<double>(IFV.nonZeros()).data());
+        SpMat DY = DX;
+        B1 = B1.array() / B1.rowwise().norm().replicate<1, 3>().array();
+        B2 = B2.array() / B2.rowwise().norm().replicate<1, 3>().array();
+        get_derivate(B1, DX);
+        get_derivate(B2, DY);
+    }
     Eigen::MatrixXi F_temp = F.cast<int>();
     for (std::size_t i = 0; i < n_iterations; ++i) {
         update_weights_and_closest_rotations();

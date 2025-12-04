@@ -43,6 +43,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <iostream>
 #include <limits>
 #include <optional>
 #include <ranges>
@@ -1221,3 +1222,18 @@ int main(int argc, char** argv)
 
     return 0;
 }
+ int main1(int argc, char** argv) {
+     Eigen::SparseMatrix<std::size_t> index_mat(100, 20);
+     std::vector<Eigen::Triplet<std::size_t>> triplets;
+     triplets.emplace_back(0, 0, 0);
+     triplets.emplace_back(0, 19, 1);
+     triplets.emplace_back(99, 19, 2);
+     index_mat.setFromTriplets(triplets.begin(), triplets.end());
+     index_mat.makeCompressed();
+     for (Eigen::Index i = 0; i < index_mat.outerSize(); ++i) {
+         for (Eigen::SparseMatrix<std::size_t>::InnerIterator it(index_mat, i); it; ++it) {
+             std::cout << "Element at (" << it.row() << ", " << it.col() << ") = " << it.value() << std::endl;
+         }
+         std::cout << std::endl;
+     }
+ }

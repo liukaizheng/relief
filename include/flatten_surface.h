@@ -12,6 +12,7 @@ using VMat2 = Eigen::Matrix<double, Eigen::Dynamic, 2>;
 using FMat = Eigen::Matrix<std::size_t, Eigen::Dynamic, 3, Eigen::RowMajor>;
 using EMat = Eigen::Matrix<double, Eigen::Dynamic, 2, Eigen::RowMajor>;
 using IVec = Eigen::Matrix<std::size_t, Eigen::Dynamic, 1>;
+using SpMat = Eigen::SparseMatrix<double>;
 
 class FlattenSurface {
 public:
