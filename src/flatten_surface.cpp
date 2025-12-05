@@ -164,7 +164,7 @@ void FlattenSurface::slim_solve(const std::size_t n_iterations) {
     {
         auto [B1, B2, N, DA, IFV, G] = grad_tri(this->V, this->F);
 
-        auto get_derivate = [&](const Eigen::Matrix<double, Eigen::Dynamic, 3>& B, SpMat& D) noexcept {
+        auto get_derivate = [&](const auto& B, auto& D) noexcept {
             auto values = D.valuePtr();
             const auto outer_indices = D.outerIndexPtr();
             const auto inner_indices = D.innerIndexPtr();
@@ -173,7 +173,7 @@ void FlattenSurface::slim_solve(const std::size_t n_iterations) {
                 const auto end = outer_indices[i + 1];
                 const auto size = end - start;
                 Eigen::Matrix<decltype(IFV)::Scalar, Eigen::Dynamic, 1>::ConstMapType I1(IFV.valuePtr() + start, size);
-                Eigen::Matrix<std::remove_pointer_t<decltype(inner_indices)>, Eigen::Dynamic, 1>::ConstMapType I2(inner_indices + start, size);
+                typename Eigen::Matrix<std::remove_pointer_t<decltype(inner_indices)>, Eigen::Dynamic, 1>::ConstMapType I2(inner_indices + start, size);
                 Eigen::VectorXd::MapType(values + start, size) = (G(I1, Eigen::placeholders::all).array() * B(I2, Eigen::placeholders::all).array()).rowwise().sum();
             }
         };
@@ -184,6 +184,24 @@ void FlattenSurface::slim_solve(const std::size_t n_iterations) {
         B2 = B2.array() / B2.rowwise().norm().replicate<1, 3>().array();
         get_derivate(B1, DX);
         get_derivate(B2, DY);
+
+        VMat4 J(B1.rows(), 4);
+        VMat4 R(B1.rows(), 4);
+        VMat4 W(B1.rows(), 4);
+        J.col(0) = DX * uv.col(0);
+        J.col(1) = DY * uv.col(0);
+        J.col(2) = DX * uv.col(1);
+        J.col(3) = DY * uv.col(1);
+
+        Eigen::Matrix2d ji, ri, ti, ui, vi;
+        Eigen::Vector2d si, swi;
+        for (Eigen::Index i = 0; i < J.rows(); ++i) {
+            igl::polar_svd(J.row(i).reshaped<Eigen::RowMajor>(Eigen::fix<2>, Eigen::fix<2>), ri, ti, ui, si, vi);
+            const auto si_arr = si.array();
+            swi = ((1.0 + si_arr) / si_arr * (1.0 + si_arr.square())).sqrt() / si_arr;
+            R.row(i).reshaped<Eigen::RowMajor>(Eigen::fix<2>, Eigen::fix<2>) = ri;
+            W.row(i).reshaped<Eigen::RowMajor>(Eigen::fix<2>, Eigen::fix<2>) = ui * swi.asDiagonal() * ui.transpose();
+        }
     }
     Eigen::MatrixXi F_temp = F.cast<int>();
     for (std::size_t i = 0; i < n_iterations; ++i) {
@@ -270,7 +288,6 @@ void FlattenSurface::update_weights_and_closest_rotations() {
 
         s1 = sing(0);
         s2 = sing(1);
-
 
         double s1_g = 2 * (s1 - pow(s1, -3));
         double s2_g = 2 * (s2 - pow(s2, -3));
