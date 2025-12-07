@@ -7,6 +7,8 @@
 #include <igl/sparse_cached.h>
 #include <igl/flip_avoiding_line_search.h>
 
+# include <algorithm>
+
 auto write_uv(const std::string& name, const VMat2& uv, const FMat& F) {
     std::ofstream file(name);
     for (Eigen::Index i = 0; i < uv.rows(); ++i) {
@@ -39,7 +41,7 @@ void cross(const Eigen::MatrixBase<DerivedV1>& V1, const Eigen::MatrixBase<Deriv
 }
 
 template<typename DerivedV, typename DerivedF>
-auto grad_tri(const Eigen::MatrixBase<DerivedV>& V, const Eigen::MatrixBase<DerivedF>& F) {
+auto grad_tri(const Eigen::MatrixBase<DerivedV>& V, const Eigen::MatrixBase<DerivedF>& F) noexcept {
     const auto n_faces = F.rows();
     const auto n_verties = V.rows();
     auto V1 = (V(F.col(2), Eigen::placeholders::all) - V(F.col(1), Eigen::placeholders::all)).eval();
@@ -97,6 +99,61 @@ auto grad_tri(const Eigen::MatrixBase<DerivedV>& V, const Eigen::MatrixBase<Deri
     // }
     // G.setFromTriplets(triplets.begin(), triplets.end());
     return std::make_tuple(std::move(V1), std::move(PV1), std::move(N), std::move(DA), std::move(IFV), std::move(G));
+}
+
+auto build_matrix_A(const RowSpMat& DX, const Eigen::Index n_fixed) noexcept {
+    using IVec = Eigen::Matrix<RowSpMat::StorageIndex, 1, Eigen::Dynamic, Eigen::RowMajor>;
+    using Mat4 = Eigen::Matrix<RowSpMat::StorageIndex, 4, Eigen::Dynamic, Eigen::RowMajor>;
+    const auto n_free = DX.innerSize() - n_fixed;
+    std::vector<RowSpMat::StorageIndex> outer_indices(DX.outerSize() * 4 + 1);
+    std::vector<RowSpMat::StorageIndex> inner_indices(DX.nonZeros() * 8);
+    outer_indices[0] = 0;
+    const auto dx_outer_indices = DX.outerIndexPtr();
+    const auto dx_inner_indices = DX.innerIndexPtr();
+    std::size_t idx = 0;
+    RowSpMat::StorageIndex pos = 0;
+    std::vector<Eigen::Index> skip_indices(DX.outerSize());
+    for (Eigen::Index i = 0; i < DX.outerSize(); i++) {
+        auto dx_start = dx_outer_indices[i];
+        const auto dx_end = dx_outer_indices[i + 1];
+        const auto local_dx_inner_indices = dx_inner_indices + dx_start;
+        skip_indices[i] = std::find_if(local_dx_inner_indices, dx_inner_indices + dx_end, [n_fixed](auto x) noexcept { return x >=  n_fixed; }) - local_dx_inner_indices;
+        dx_start += skip_indices[i];
+        const auto size = dx_end - dx_start;
+        const auto double_size = size * 2;
+        const auto local_inner_indices = IVec::Map(dx_inner_indices + dx_start, size).array();
+        auto block = Mat4::Map(inner_indices.data() + pos, 4, double_size);
+        block.leftCols(size) = (local_inner_indices - n_fixed).replicate<4, 1>();
+        block.rightCols(size) = (local_inner_indices + (n_free - n_fixed)).replicate<4, 1>();
+
+        IVec::Map(outer_indices.data() + idx + 1, 4) = IVec::LinSpaced(4, pos + double_size, pos + double_size * 4);
+        pos += double_size * 4;
+        idx += 4;
+    }
+    inner_indices.resize(pos);
+    RowSpMat A = RowSpMat::Map(DX.rows() * 4, n_free * 2, inner_indices.size(), outer_indices.data(), inner_indices.data(), std::vector<double>(inner_indices.size()).data());
+    return std::make_pair(std::move(A), std::move(skip_indices));
+}
+
+void assign_matrix_A(const RowSpMat& DX, const RowSpMat& DY, const VMat4& W, const std::vector<Eigen::Index>& skip_indices, RowSpMat& A, Eigen::VectorXd& boundary_contribution) noexcept {
+    using RowVecd = Eigen::Matrix<RowSpMat::Scalar, 1, Eigen::Dynamic>;
+    using Mat4 = Eigen::Matrix<RowSpMat::Scalar, 4, Eigen::Dynamic, Eigen::RowMajor>;
+    const auto outer_indices = A.outerIndexPtr();
+    const auto inner_indices = A.innerIndexPtr();
+    boundary_contribution.setZero();
+    for (Eigen::Index i = 0; i < DX.rows(); i++) {
+        const auto idx = i * 4;
+        const auto start = outer_indices[idx];
+        const auto end = outer_indices[idx + 1];
+        const auto size = end - start;
+        const auto half_size = size / 2;
+        const auto dx = RowVecd::Map(DX.valuePtr() + DX.outerIndexPtr()[i] + skip_indices[i], half_size);
+        const auto dy = RowVecd::Map(DY.valuePtr() + DY.outerIndexPtr()[i] + skip_indices[i], half_size);
+        const auto wi = W.row(i).transpose().array().replicate(1, half_size);
+        auto block = Mat4::Map(A.valuePtr() + start, 4, size);
+        block.topRows(2).reshaped<Eigen::RowMajor>(4, half_size) = dx.replicate<4, 1>().array() * wi;
+        block.bottomRows(2).reshaped<Eigen::RowMajor>(4, half_size) = dy.replicate<4, 1>().array() * wi;
+    }
 }
 
 FlattenSurface::FlattenSurface(VMat&& V, FMat&& F, const std::vector<std::size_t>& segment_offsets) noexcept : V(std::move(V)), F(std::move(F)), n_bnd_points(segment_offsets.back()) {
@@ -164,43 +221,60 @@ void FlattenSurface::slim_solve(const std::size_t n_iterations) {
     {
         auto [B1, B2, N, DA, IFV, G] = grad_tri(this->V, this->F);
 
-        auto get_derivate = [&](const auto& B, auto& D) noexcept {
-            auto values = D.valuePtr();
-            const auto outer_indices = D.outerIndexPtr();
-            const auto inner_indices = D.innerIndexPtr();
-            for (Eigen::Index i = 0; i < D.outerSize(); i++) {
+        auto get_derivate = [&](const auto& B, double* values) noexcept {
+            const auto outer_indices = IFV.outerIndexPtr();
+            const auto inner_indices = IFV.innerIndexPtr();
+            for (Eigen::Index i = 0; i < IFV.outerSize(); i++) {
                 const auto start = outer_indices[i];
                 const auto end = outer_indices[i + 1];
                 const auto size = end - start;
-                Eigen::Matrix<decltype(IFV)::Scalar, Eigen::Dynamic, 1>::ConstMapType I1(IFV.valuePtr() + start, size);
-                typename Eigen::Matrix<std::remove_pointer_t<decltype(inner_indices)>, Eigen::Dynamic, 1>::ConstMapType I2(inner_indices + start, size);
-                Eigen::VectorXd::MapType(values + start, size) = (G(I1, Eigen::placeholders::all).array() * B(I2, Eigen::placeholders::all).array()).rowwise().sum();
+                const auto I1 = Eigen::Matrix<decltype(IFV)::Scalar, Eigen::Dynamic, 1>::Map(IFV.valuePtr() + start, size);
+                const auto I2 = Eigen::Matrix<SpMat::StorageIndex, Eigen::Dynamic, 1>::Map(inner_indices + start, size);
+                Eigen::VectorXd::Map(values + start, size) = (G(I1, Eigen::placeholders::all).array() * B(I2, Eigen::placeholders::all).array()).rowwise().sum();
             }
         };
 
-        SpMat DX = SpMat::Map(IFV.rows(), IFV.cols(), IFV.nonZeros(), IFV.outerIndexPtr(), IFV.innerIndexPtr(), std::vector<double>(IFV.nonZeros()).data());
-        SpMat DY = DX;
         B1 = B1.array() / B1.rowwise().norm().replicate<1, 3>().array();
         B2 = B2.array() / B2.rowwise().norm().replicate<1, 3>().array();
-        get_derivate(B1, DX);
-        get_derivate(B2, DY);
+        RowSpMat DX;
+        RowSpMat DY;
+        {
+            std::vector<double> temp(IFV.nonZeros());
+            get_derivate(B1, temp.data());
+            DX = SpMat::Map(IFV.rows(), IFV.cols(), IFV.nonZeros(), IFV.outerIndexPtr(), IFV.innerIndexPtr(), temp.data());
+            get_derivate(B2, temp.data());
+            DY = SpMat::Map(IFV.rows(), IFV.cols(), IFV.nonZeros(), IFV.outerIndexPtr(), IFV.innerIndexPtr(), temp.data());
+        }
+
 
         VMat4 J(B1.rows(), 4);
         VMat4 R(B1.rows(), 4);
         VMat4 W(B1.rows(), 4);
-        J.col(0) = DX * uv.col(0);
-        J.col(1) = DY * uv.col(0);
-        J.col(2) = DX * uv.col(1);
-        J.col(3) = DY * uv.col(1);
 
         Eigen::Matrix2d ji, ri, ti, ui, vi;
         Eigen::Vector2d si, swi;
-        for (Eigen::Index i = 0; i < J.rows(); ++i) {
-            igl::polar_svd(J.row(i).reshaped<Eigen::RowMajor>(Eigen::fix<2>, Eigen::fix<2>), ri, ti, ui, si, vi);
-            const auto si_arr = si.array();
-            swi = ((1.0 + si_arr) / si_arr * (1.0 + si_arr.square())).sqrt() / si_arr;
-            R.row(i).reshaped<Eigen::RowMajor>(Eigen::fix<2>, Eigen::fix<2>) = ri;
-            W.row(i).reshaped<Eigen::RowMajor>(Eigen::fix<2>, Eigen::fix<2>) = ui * swi.asDiagonal() * ui.transpose();
+        RowSpMat A;
+        std::vector<Eigen::Index> skip_indices;
+        Eigen::VectorXd boundary_contribution((V.rows() - n_bnd_points) * 2);
+        for (std::size_t _ = 0; _ < n_iterations; ++_) {
+            // update jacobian
+            J.col(0) = DX * uv.col(0);
+            J.col(1) = DX * uv.col(1);
+            J.col(2) = DY * uv.col(0);
+            J.col(3) = DY * uv.col(1);
+
+            // update rotation and weight matrices
+            for (Eigen::Index i = 0; i < J.rows(); ++i) {
+                igl::polar_svd(J.row(i).reshaped(Eigen::fix<2>, Eigen::fix<2>), ri, ti, ui, si, vi);
+                const auto si_arr = si.array();
+                swi = ((1.0 + si_arr) / si_arr * (1.0 + si_arr.square())).sqrt() / si_arr;
+                R.row(i).reshaped(Eigen::fix<2>, Eigen::fix<2>) = ri;
+                W.row(i).reshaped<Eigen::RowMajor>(Eigen::fix<2>, Eigen::fix<2>) = ui * swi.asDiagonal() * ui.transpose();
+            }
+            if (skip_indices.empty()) {
+                std::tie(A, skip_indices) = build_matrix_A(DX, n_bnd_points);
+            }
+            assign_matrix_A(DX, DY, W, skip_indices, A, boundary_contribution);
         }
     }
     Eigen::MatrixXi F_temp = F.cast<int>();
@@ -218,6 +292,7 @@ void FlattenSurface::slim_solve(const std::size_t n_iterations) {
         ) / mesh_area;
         uv = uv_temp;
     }
+    write_uv("uv.obj", uv, F);
 }
 
 void FlattenSurface::pre_calc() {
