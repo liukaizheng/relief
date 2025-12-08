@@ -61,10 +61,10 @@ auto grad_tri(const Eigen::MatrixBase<DerivedV>& V, const Eigen::MatrixBase<Deri
     cross(N, V2, PV2);
     PV2 = PV2.array() / DA_M;
 
-    auto V3 = (V(F.col(1), Eigen::placeholders::all) - V(F.col(0), Eigen::placeholders::all)).eval();
-    Mat PV3(n_faces, 3);
-    cross(N, V3, PV3);
-    PV3 = PV3.array() / DA_M;
+    // auto V3 = (V(F.col(1), Eigen::placeholders::all) - V(F.col(0), Eigen::placeholders::all)).eval();
+    // Mat PV3(n_faces, 3);
+    // cross(N, V3, PV3);
+    // PV3 = PV3.array() / DA_M;
 
     Eigen::SparseMatrix<Eigen::Index> IFV(n_faces, n_verties);
     std::vector<Eigen::Triplet<Eigen::Index>> triplets;
@@ -98,7 +98,7 @@ auto grad_tri(const Eigen::MatrixBase<DerivedV>& V, const Eigen::MatrixBase<Deri
 
     // }
     // G.setFromTriplets(triplets.begin(), triplets.end());
-    return std::make_tuple(std::move(V3), std::move(PV3), std::move(N), std::move(DA), std::move(IFV), std::move(G));
+    return std::make_tuple(std::move(V1), std::move(PV1), std::move(N), std::move(DA), std::move(IFV), std::move(G));
 }
 
 auto build_matrix_A(const RowSpMat& DX, const Eigen::Index n_fixed) noexcept {
@@ -169,11 +169,56 @@ void assign_matrix_A(const RowSpMat& DX, const RowSpMat& DY, const VMat4& W, con
 
         contribution_slice.segment(0, 2) += dx_block.leftCols(skip_indices[i]).reshaped<Eigen::RowMajor>(2, skip_indices[i] * 2).matrix() * flatten_uv;
         contribution_slice.segment(2, 2) += dy_block.leftCols(skip_indices[i]).reshaped<Eigen::RowMajor>(2, skip_indices[i] * 2).matrix() * flatten_uv;
-        if (i == 0) {
-            std::cout << "dx_block:\n" << dx_block << "\n";
-            std::cout << "dx_block_reshape:\n" << dx_block.leftCols(skip_indices[i]).reshaped<Eigen::RowMajor>(2, skip_indices[i] * 2) << "\n";
-            const auto a = 2;
+    }
+}
+
+auto transpose_sparse_matrix(const RowSpMat& A) noexcept {
+    const auto outer_indices = A.outerIndexPtr();
+    const auto inner_indices = A.innerIndexPtr();
+    const auto values = A.valuePtr();
+
+    RowSpMat dest(A.cols(), A.rows());
+    dest.resizeNonZeros(A.nonZeros());
+    auto new_outer_indices = dest.outerIndexPtr();
+    auto new_inner_indices = dest.innerIndexPtr();
+    auto new_values = dest.valuePtr();
+
+    RowSpMat::IndexVector::Map(new_outer_indices, dest.outerSize()).setZero();
+    for (Eigen::Index i = 0; i < A.outerSize(); i++) {
+        for (RowSpMat::InnerIterator it(A, i); it; ++it) {
+            new_outer_indices[it.index()]++;
         }
+    }
+
+    RowSpMat::IndexVector positions(dest.outerSize());
+    RowSpMat::IndexVector old_to_new_indices(A.nonZeros());
+    RowSpMat::StorageIndex count = 0;
+    for (Eigen::Index i = 0; i < dest.outerSize(); i++) {
+        auto temp = new_outer_indices[i];
+        new_outer_indices[i] = count;
+        positions[i] = count;
+        count += temp;
+    }
+    new_outer_indices[dest.outerSize()] = count;
+
+    for (Eigen::Index i = 0; i < A.outerSize(); i++) {
+        const auto start = outer_indices[i];
+        const auto end = outer_indices[i + 1];
+        for (Eigen::Index j = start; j < end; j++) {
+            const auto pos = positions[inner_indices[j]]++;
+            new_inner_indices[pos] = i;
+            new_values[pos] = values[j];
+            old_to_new_indices[j] = pos;
+        }
+    }
+    return std::make_tuple(std::move(dest), std::move(old_to_new_indices));
+}
+
+void assign_rhs(const VMat4& W, const VMat4& R, Eigen::VectorXd& rhs) noexcept {
+    Eigen::Index idx = 0;
+    for (Eigen::Index i = 0; i < W.rows(); ++i) {
+        rhs.segment(idx, 4).reshaped(2, 2) = W.row(i).reshaped<Eigen::RowMajor>(2, 2) * R.row(i).reshaped(2, 2);
+        idx += 4;
     }
 }
 
@@ -275,8 +320,13 @@ void FlattenSurface::slim_solve(const std::size_t n_iterations) {
         Eigen::Matrix2d ji, ri, ti, ui, vi;
         Eigen::Vector2d si, swi;
         RowSpMat A;
+        RowSpMat At;
         std::vector<Eigen::Index> skip_indices;
+        RowSpMat::IndexVector A_to_At_indices;
         Eigen::VectorXd boundary_contribution(B1.rows() * 4);
+        Eigen::VectorXd rhs(B1.rows() * 4);
+        const auto DDA = DA.replicate<1, 4>().reshaped<Eigen::RowMajor>().asDiagonal();
+        VMat2 new_uv = uv;
         for (std::size_t _ = 0; _ < 1; ++_) {
             // update jacobian
             J.col(0) = DX * uv.col(0);
@@ -296,25 +346,49 @@ void FlattenSurface::slim_solve(const std::size_t n_iterations) {
                 std::tie(A, skip_indices) = build_matrix_A(DX, n_bnd_points);
             }
             assign_matrix_A(DX, DY, W, skip_indices, uv, A, boundary_contribution);
-            std::cout << "boundary contribution: " << boundary_contribution.segment(0, 4).transpose() << std::endl;
-            A1_global = A;
-            bnd_uv_contri = boundary_contribution;
-            for (Eigen::Index idx = 0; idx < A.rows(); ++idx) {
-                const auto i = idx / 4;
-                const auto j = idx % 4;
-                if (j == 0) {
-                    A1_global.row(i) = A.row(idx);
-                    bnd_uv_contri(i) = boundary_contribution(idx);
-                } else if (j == 1) {
-                    A1_global.row(2 * F.rows() + i) = A.row(idx);
-                    bnd_uv_contri(2 * F.rows() + i) = boundary_contribution(idx);
-                } else if (j == 2) {
-                    A1_global.row(F.rows() + i) = A.row(idx);
-                    bnd_uv_contri(F.rows() + i) = boundary_contribution(idx);
-                } else if (j == 3) {
-                    A1_global.row(3 * F.rows() + i) = A.row(idx);
-                    bnd_uv_contri(3 * F.rows() + i) = boundary_contribution(idx);
-                }
+            // A1_global = A;
+            // bnd_uv_contri = boundary_contribution;
+            // for (Eigen::Index idx = 0; idx < A.rows(); ++idx) {
+            //     const auto i = idx / 4;
+            //     const auto j = idx % 4;
+            //     if (j == 0) {
+            //         A1_global.row(i) = A.row(idx);
+            //         bnd_uv_contri(i) = boundary_contribution(idx);
+            //     } else if (j == 1) {
+            //         A1_global.row(2 * F.rows() + i) = A.row(idx);
+            //         bnd_uv_contri(2 * F.rows() + i) = boundary_contribution(idx);
+            //     } else if (j == 2) {
+            //         A1_global.row(F.rows() + i) = A.row(idx);
+            //         bnd_uv_contri(F.rows() + i) = boundary_contribution(idx);
+            //     } else if (j == 3) {
+            //         A1_global.row(3 * F.rows() + i) = A.row(idx);
+            //         bnd_uv_contri(3 * F.rows() + i) = boundary_contribution(idx);
+            //     }
+            // }
+            assign_rhs(W, R, rhs);
+            rhs -= boundary_contribution;
+
+            if (A_to_At_indices.size() == 0) {
+                std::tie(At, A_to_At_indices) = transpose_sparse_matrix(A);
+                At.setZero();
+                RowSpMat::ScalarVector::Map(At.valuePtr(), A.nonZeros())(A_to_At_indices) = RowSpMat::ScalarVector::Map(A.valuePtr(), A.nonZeros());
+                RowSpMat At_temp = A.transpose();
+                const auto error = (At_temp - At).norm();
+                assert(error < 1e-10);
+            }
+
+            {
+                RowSpMat At = A.transpose();
+                At.makeCompressed();
+
+                RowSpMat L = At * DDA * A;
+                rhs = At * DDA * rhs;
+
+                Eigen::SimplicialLDLT<Eigen::SparseMatrix<double> > solver;
+                new_uv.bottomRows(V.rows() - n_bnd_points).reshaped() = solver.compute(L).solve(rhs);
+
+                write_uv("uv_new.obj", new_uv, F);
+                const auto a = 2;
             }
         }
     }
@@ -451,10 +525,9 @@ VMat2 FlattenSurface::solve_weighted_arap() {
     A1.rightCols(v_n - n_bnd_points) = A.middleCols(v_n + n_bnd_points, v_n - n_bnd_points);
     A1.makeCompressed();
 
-    SpMat A1_temp = A1_global;
-    auto max_err = (A1 - A1_temp).cwiseAbs().eval().coeffs().maxCoeff();
-    auto max_err2 = (bnd_uv_contribution - bnd_uv_contri).cwiseAbs().maxCoeff();
-    std::cout << "bnd uv: " << bnd_uv_contribution(Eigen::seqN(0, 4, F.rows())).transpose() << std::endl;
+    // SpMat A1_temp = A1_global;
+    // auto max_err = (A1 - A1_temp).cwiseAbs().eval().coeffs().maxCoeff();
+    // auto max_err2 = (bnd_uv_contribution - bnd_uv_contri).cwiseAbs().maxCoeff();
 
     Eigen::SparseMatrix<double> A1t = A1.transpose();
     A1t.makeCompressed();
