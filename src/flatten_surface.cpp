@@ -346,41 +346,16 @@ void FlattenSurface::slim_solve(const std::size_t n_iterations) {
                 std::tie(A, skip_indices) = build_matrix_A(DX, n_bnd_points);
             }
             assign_matrix_A(DX, DY, W, skip_indices, uv, A, boundary_contribution);
-            // A1_global = A;
-            // bnd_uv_contri = boundary_contribution;
-            // for (Eigen::Index idx = 0; idx < A.rows(); ++idx) {
-            //     const auto i = idx / 4;
-            //     const auto j = idx % 4;
-            //     if (j == 0) {
-            //         A1_global.row(i) = A.row(idx);
-            //         bnd_uv_contri(i) = boundary_contribution(idx);
-            //     } else if (j == 1) {
-            //         A1_global.row(2 * F.rows() + i) = A.row(idx);
-            //         bnd_uv_contri(2 * F.rows() + i) = boundary_contribution(idx);
-            //     } else if (j == 2) {
-            //         A1_global.row(F.rows() + i) = A.row(idx);
-            //         bnd_uv_contri(F.rows() + i) = boundary_contribution(idx);
-            //     } else if (j == 3) {
-            //         A1_global.row(3 * F.rows() + i) = A.row(idx);
-            //         bnd_uv_contri(3 * F.rows() + i) = boundary_contribution(idx);
-            //     }
-            // }
             assign_rhs(W, R, rhs);
             rhs -= boundary_contribution;
 
             if (A_to_At_indices.size() == 0) {
                 std::tie(At, A_to_At_indices) = transpose_sparse_matrix(A);
-                At.setZero();
+            } else {
                 RowSpMat::ScalarVector::Map(At.valuePtr(), A.nonZeros())(A_to_At_indices) = RowSpMat::ScalarVector::Map(A.valuePtr(), A.nonZeros());
-                RowSpMat At_temp = A.transpose();
-                const auto error = (At_temp - At).norm();
-                assert(error < 1e-10);
             }
 
             {
-                RowSpMat At = A.transpose();
-                At.makeCompressed();
-
                 RowSpMat L = At * DDA * A;
                 rhs = At * DDA * rhs;
 
