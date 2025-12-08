@@ -7,7 +7,7 @@
 #include <vector>
 
 using VMat = Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor>;
-using VMat2 = Eigen::Matrix<double, Eigen::Dynamic, 2, Eigen::RowMajor>;
+using VMat2 = Eigen::Matrix<double, Eigen::Dynamic, 2>;
 using VMat4 = Eigen::Matrix<double, Eigen::Dynamic, 4, Eigen::RowMajor>;
 using MatXu = Eigen::Matrix<std::size_t, Eigen::Dynamic, Eigen::Dynamic>;
 using FMat = Eigen::Matrix<std::size_t, Eigen::Dynamic, 3, Eigen::RowMajor>;
@@ -52,4 +52,8 @@ public:
     Eigen::VectorXi A_data;
     Eigen::SparseMatrix<double> AtA;
     igl::AtA_cached_data AtA_data;
+
+    // rember to delete
+    RowSpMat A1_global;
+    Eigen::VectorXd bnd_uv_contri;
 };

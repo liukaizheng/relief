@@ -1204,7 +1204,6 @@ int main(int argc, char** argv)
     Mesh_2 uv_mesh;
     PMP::polygon_soup_to_polygon_mesh(uv_points, patch_faces, uv_mesh);
 
-    write_uv("uv1.obj", flatten_surface.uv, flatten_surface.F);
     auto [
         relief_base_uvs, relief_base_faces, point_faces, grid_point_vertex_indices, path_face_vertices, bary_centers
     ] = add_grid_into_uv_domain(uv_mesh, grid_dimension, flatten_surface.mean_edge_length);
@@ -1223,17 +1222,16 @@ int main(int argc, char** argv)
     return 0;
 }
  int main1(int argc, char** argv) {
-     Eigen::SparseMatrix<std::size_t> index_mat(100, 20);
-     std::vector<Eigen::Triplet<std::size_t>> triplets;
-     triplets.emplace_back(0, 0, 0);
-     triplets.emplace_back(0, 19, 1);
-     triplets.emplace_back(99, 19, 2);
-     index_mat.setFromTriplets(triplets.begin(), triplets.end());
-     index_mat.makeCompressed();
-     for (Eigen::Index i = 0; i < index_mat.outerSize(); ++i) {
-         for (Eigen::SparseMatrix<std::size_t>::InnerIterator it(index_mat, i); it; ++it) {
-             std::cout << "Element at (" << it.row() << ", " << it.col() << ") = " << it.value() << std::endl;
-         }
-         std::cout << std::endl;
-     }
+     Eigen::Matrix<std::size_t, 3, 2> col_index_mat;
+     col_index_mat << 0, 1, 2, 3, 4, 5;
+     std::cout << col_index_mat << std::endl;
+
+     Eigen::Matrix<std::size_t, 3, 2, Eigen::RowMajor> row_index_mat = col_index_mat;
+
+     std::cout << "colmajor reshaped colmajor:\n" << col_index_mat.reshaped(2, 3) << std::endl;
+     std::cout << "rowmajor reshaped colmajor:\n" << row_index_mat.reshaped(2, 3) << std::endl;
+
+     std::cout << "colmajor reshaped rowmajor:\n" << col_index_mat.reshaped<Eigen::RowMajor>(2, 3) << std::endl;
+     std::cout << "rowmajor reshaped rowmajor:\n" << row_index_mat.reshaped<Eigen::RowMajor>(2, 3) << std::endl;
+     return 0;
  }
