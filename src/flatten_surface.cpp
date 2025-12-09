@@ -214,11 +214,133 @@ auto transpose_sparse_matrix(const RowSpMat& A) noexcept {
     return std::make_tuple(std::move(dest), std::move(old_to_new_indices));
 }
 
+struct AtAData {
+    using StorageIndex = RowSpMat::StorageIndex;
+    using IndexVector = RowSpMat::IndexVector;
+    using ScalarVector = RowSpMat::ScalarVector;
+
+    AtAData() noexcept = default;
+    auto build(const RowSpMat& At) noexcept;
+    void assign(const RowSpMat& At, const Eigen::VectorXd& M, RowSpMat& L) noexcept;
+
+    std::vector<StorageIndex> entry_outer_indices;
+    std::vector<StorageIndex> row_indices;
+    std::vector<StorageIndex> col_indices;
+    std::vector<StorageIndex> top_right_inner_indices;
+    std::vector<StorageIndex> bottom_left_inner_indices;
+    std::vector<StorageIndex> bottom_left_to_top_right_map;
+};
+
+auto AtAData::build(const RowSpMat& At) noexcept {
+    const auto outer_indices = At.outerIndexPtr();
+    const auto inner_indices = At.innerIndexPtr();
+    const auto values = At.valuePtr();
+    constexpr RowSpMat::StorageIndex INVALID = -1;
+
+    entry_outer_indices.emplace_back(0);
+    std::vector<StorageIndex> new_outer_indices{0};
+    std::vector<StorageIndex> new_inner_indices;
+    std::vector<StorageIndex> col_start(At.outerSize(), INVALID);
+    std::vector<StorageIndex> col_end(At.outerSize(), INVALID);
+    std::vector<StorageIndex> col_next;
+    std::vector<StorageIndex> inner_row_indices;
+    for (Eigen::Index r = 0; r < At.outerSize(); r++) {
+        // setup left part
+        auto curr = col_start[r];
+        while(curr != INVALID) {
+            bottom_left_inner_indices.emplace_back(new_inner_indices.size());
+            bottom_left_to_top_right_map.emplace_back(curr);
+            new_inner_indices.emplace_back(inner_row_indices[curr]);
+            inner_row_indices.emplace_back(INVALID);
+            col_next.emplace_back(INVALID);
+            curr = col_next[curr];
+        }
+        for (Eigen::Index c = r; c < At.outerSize(); c++) {
+            auto ri = outer_indices[c];
+            for (StorageIndex li = outer_indices[r]; li < outer_indices[r + 1]; li++) {
+                const auto left_inner_idx = inner_indices[li];
+                while(ri < outer_indices[c + 1] && inner_indices[ri] < left_inner_idx) {
+                    ri++;
+                }
+
+                if (ri == outer_indices[c + 1]) {
+                    break;
+                }
+
+                if (inner_indices[ri] == left_inner_idx) {
+                    row_indices.emplace_back(li);
+                    col_indices.emplace_back(ri);
+                    ri++;
+                    if (ri == outer_indices[c + 1]) {
+                        break;
+                    }
+                }
+            }
+            if (row_indices.size() != entry_outer_indices.back()) {
+                entry_outer_indices.emplace_back(row_indices.size());
+                const StorageIndex new_inner_idx = new_inner_indices.size();
+                col_next.emplace_back(INVALID);
+                inner_row_indices.emplace_back(r);
+                new_inner_indices.emplace_back(c);
+                top_right_inner_indices.emplace_back(new_inner_idx);
+                if (col_start[c] == INVALID) {
+                    col_start[c] = new_inner_idx;
+                    col_end[c] = new_inner_idx;
+                } else {
+                    col_next[col_end[c]] = new_inner_idx;
+                    col_end[c] = new_inner_idx;
+                }
+            }
+        }
+        new_outer_indices.emplace_back(new_inner_indices.size());
+    }
+
+    RowSpMat L(At.outerSize(), At.outerSize());
+    L.resizeNonZeros(new_inner_indices.size());
+    IndexVector::Map(L.outerIndexPtr(), new_outer_indices.size()) = IndexVector::Map(new_outer_indices.data(), new_outer_indices.size());
+    IndexVector::Map(L.innerIndexPtr(), new_inner_indices.size()) = IndexVector::Map(new_inner_indices.data(), new_inner_indices.size());
+    return L;
+}
+
+void AtAData::assign(const RowSpMat& At, const Eigen::VectorXd& M, RowSpMat& L) noexcept {
+    const auto values_arr = ScalarVector::Map(At.valuePtr(), At.nonZeros());
+    const auto block = (values_arr(row_indices).array()
+        * M(IndexVector::Map(At.innerIndexPtr(), At.nonZeros())(row_indices)).array()
+        * values_arr(col_indices).array()).eval();
+    auto new_values_arr = ScalarVector::Map(L.valuePtr(), L.nonZeros());
+    for (std::size_t i = 0; i < top_right_inner_indices.size(); i++) {
+        new_values_arr[top_right_inner_indices[i]] = block.segment(entry_outer_indices[i], entry_outer_indices[i + 1] - entry_outer_indices[i]).sum();
+    }
+
+    new_values_arr(bottom_left_inner_indices) = new_values_arr(bottom_left_to_top_right_map);
+}
+
 void assign_rhs(const VMat4& W, const VMat4& R, Eigen::VectorXd& rhs) noexcept {
     Eigen::Index idx = 0;
     for (Eigen::Index i = 0; i < W.rows(); ++i) {
         rhs.segment(idx, 4).reshaped(2, 2) = W.row(i).reshaped<Eigen::RowMajor>(2, 2) * R.row(i).reshaped(2, 2);
         idx += 4;
+    }
+}
+
+/*
+ * A * M * b
+ */
+void get_At_M_b(const RowSpMat& At, const Eigen::VectorXd& M, const Eigen::VectorXd& b, Eigen::VectorXd& rhs) noexcept {
+    const auto outer_indices = At.outerIndexPtr();
+    const auto inner_indices = At.innerIndexPtr();
+    const auto values = At.valuePtr();
+
+    for (Eigen::Index i = 0; i < At.outerSize(); ++i) {
+        const auto start = outer_indices[i];
+        const auto end = outer_indices[i + 1];
+        const auto size = end - start;
+        const auto I =RowSpMat::IndexVector::Map(inner_indices + start, size);
+        rhs[i] = (RowSpMat::ScalarVector::Map(values + start, size).array()
+            * M(I).array())
+            .matrix()
+            .transpose()
+            * b(I);
     }
 }
 
@@ -285,6 +407,7 @@ FlattenSurface::FlattenSurface(VMat&& V, FMat&& F, const std::vector<std::size_t
 void FlattenSurface::slim_solve(const std::size_t n_iterations) {
     pre_calc();
     {
+        Eigen::Index n_free = this->V.rows() - n_bnd_points;
         VMat2 uv = this->uv;
         auto [B1, B2, N, DA, IFV, G] = grad_tri(this->V, this->F);
 
@@ -321,11 +444,14 @@ void FlattenSurface::slim_solve(const std::size_t n_iterations) {
         Eigen::Vector2d si, swi;
         RowSpMat A;
         RowSpMat At;
+        AtAData AtA_data;
+        RowSpMat L;
         std::vector<Eigen::Index> skip_indices;
         RowSpMat::IndexVector A_to_At_indices;
         Eigen::VectorXd boundary_contribution(B1.rows() * 4);
         Eigen::VectorXd rhs(B1.rows() * 4);
-        const auto DDA = DA.replicate<1, 4>().reshaped<Eigen::RowMajor>().asDiagonal();
+        Eigen::VectorXd real_rhs(n_free * 2);
+        const auto DDA = DA.replicate<1, 4>().reshaped<Eigen::RowMajor>().eval();
         VMat2 new_uv = uv;
         for (std::size_t _ = 0; _ < 1; ++_) {
             // update jacobian
@@ -355,16 +481,18 @@ void FlattenSurface::slim_solve(const std::size_t n_iterations) {
                 RowSpMat::ScalarVector::Map(At.valuePtr(), A.nonZeros())(A_to_At_indices) = RowSpMat::ScalarVector::Map(A.valuePtr(), A.nonZeros());
             }
 
-            {
-                RowSpMat L = At * DDA * A;
-                rhs = At * DDA * rhs;
-
-                Eigen::SimplicialLDLT<Eigen::SparseMatrix<double> > solver;
-                new_uv.bottomRows(V.rows() - n_bnd_points).reshaped() = solver.compute(L).solve(rhs);
-
-                write_uv("uv_new.obj", new_uv, F);
-                const auto a = 2;
+            if (L.size() == 0) {
+                L = AtA_data.build(At);
             }
+            AtA_data.assign(At, DDA, L);
+            Eigen::VectorXd rhs1 = At * DDA.asDiagonal() * rhs;
+            get_At_M_b(At, DDA, rhs, real_rhs);
+            auto error = (rhs1 - real_rhs).norm();
+
+            Eigen::SimplicialLDLT<Eigen::SparseMatrix<double> > solver;
+            new_uv.bottomRows(V.rows() - n_bnd_points).reshaped() = solver.compute(L).solve(real_rhs);
+
+            write_uv("uv_new.obj", new_uv, F);
         }
     }
     Eigen::MatrixXi F_temp = F.cast<int>();
