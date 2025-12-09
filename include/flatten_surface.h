@@ -23,37 +23,10 @@ public:
     void slim_solve(const std::size_t n_iterations);
 public:
 
-    void pre_calc();
-    void compute_jacobians(const VMat2& uv_new);
-    void update_weights_and_closest_rotations();
-    double compute_energy(const VMat2& uv_new);
-    VMat2 solve_weighted_arap();
-    std::vector<class Eigen::Triplet<double>> build_A();
-    void build_rhs();
     VMat V;
     FMat F;
 
     VMat2 uv;
     const std::size_t n_bnd_points;
-    const double proximal_p = 0.0001;
-    double mesh_area;
     double mean_edge_length;
-    double energy;
-
-    Eigen::VectorXd M;
-    Eigen::VectorXd WGL_M;
-    Eigen::MatrixXd Ji;
-    Eigen::MatrixXd Ri;
-    Eigen::MatrixXd W;
-    Eigen::VectorXd rhs;
-    Eigen::SparseMatrix<double> Dx,Dy,Dz;
-
-    Eigen::SparseMatrix<double> A;
-    Eigen::VectorXi A_data;
-    Eigen::SparseMatrix<double> AtA;
-    igl::AtA_cached_data AtA_data;
-
-    // rember to delete
-    RowSpMat A1_global;
-    Eigen::VectorXd bnd_uv_contri;
 };
