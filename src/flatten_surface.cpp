@@ -1,6 +1,5 @@
 #include "flatten_surface.h"
 #include <igl/harmonic.h>
-#include <igl/grad.h>
 #include <igl/polar_svd.h>
 
 # include <algorithm>
@@ -503,7 +502,6 @@ FlattenSurface::FlattenSurface(VMat&& V, FMat&& F, const std::vector<std::size_t
 
 void FlattenSurface::slim_solve(const std::size_t n_iterations) {
     Eigen::Index n_free = this->V.rows() - n_bnd_points;
-    VMat2 uv = this->uv;
     auto [B1, B2, N, DA, IFV, G] = tri_gradients(this->V, this->F);
     DA /= DA.sum();
 

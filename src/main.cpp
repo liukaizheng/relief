@@ -40,6 +40,7 @@
 #include <igl/per_face_normals.h>
 
 #include "flatten_surface.h"
+#include "igl/PI.h"
 
 #include <algorithm>
 #include <cmath>
@@ -1129,7 +1130,7 @@ auto get_top_boundary(const std::size_t grid_dimensioin, const MatXu& index_mat)
 
 } // namespace
 
-int main(int argc, char** argv)
+int main1(int argc, char** argv)
 {
     CLI::App app { "Relief App" };
     std::string mesh_path;
@@ -1221,17 +1222,33 @@ int main(int argc, char** argv)
 
     return 0;
 }
- int main1(int argc, char** argv) {
-     Eigen::Matrix<std::size_t, 3, 2> col_index_mat;
-     col_index_mat << 0, 1, 2, 3, 4, 5;
-     std::cout << col_index_mat << std::endl;
+ int main(int argc, char** argv) {
+     Eigen::Matrix2d uv;
+     uv << 1, 0, 0, 1;
+     using Mat23 = Eigen::Matrix<double, 2, 3>;
+     Mat23 X;
+     X << 1, 0, 0,
+          1, 1, 1;
 
-     Eigen::Matrix<std::size_t, 3, 2, Eigen::RowMajor> row_index_mat = col_index_mat;
+     Eigen::Vector3d axis = Eigen::Vector3d::Random();
+     axis.normalize();
 
-     std::cout << "colmajor reshaped colmajor:\n" << col_index_mat.reshaped(2, 3) << std::endl;
-     std::cout << "rowmajor reshaped colmajor:\n" << row_index_mat.reshaped(2, 3) << std::endl;
+     Eigen::Transform<double, 3, Eigen::Affine> t(Eigen::AngleAxis(igl::PI / 6.0, axis));
+     X.row(0).transpose() = t * X.row(0).transpose();
+     X.row(1).transpose() = t * X.row(1).transpose();
 
-     std::cout << "colmajor reshaped rowmajor:\n" << col_index_mat.reshaped<Eigen::RowMajor>(2, 3) << std::endl;
-     std::cout << "rowmajor reshaped rowmajor:\n" << row_index_mat.reshaped<Eigen::RowMajor>(2, 3) << std::endl;
+     Eigen::JacobiSVD<Mat23, Eigen::ComputeFullU | Eigen::ComputeFullV> svd(X);
+
+     auto U = svd.matrixU();
+     auto V = svd.matrixV();
+     auto S = svd.singularValues();
+
+     Mat23 D = (U * S.asDiagonal() * V.transpose().topRows(2) -  X).eval();
+
+     std::cout << "Transformed Matrix X:\n" << X << std::endl;
+     std::cout << "matrix U:\n" << svd.matrixU() << std::endl;
+     std::cout << "matrix V:\n" << svd.matrixV() << std::endl;
+     std::cout << "singular values:\n" << svd.singularValues() << std::endl;
+     std::cout << "matrix D:\n" << D << std::endl;
      return 0;
  }

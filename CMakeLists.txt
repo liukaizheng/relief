@@ -40,6 +40,7 @@ CPMAddPackage(
 
 add_executable(relief_app
     src/flatten_surface.cpp
+    src/deform_surface.cpp
     src/main.cpp
 )
 target_compile_features(relief_app PRIVATE cxx_std_23)
