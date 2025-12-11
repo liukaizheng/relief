@@ -1,5 +1,43 @@
+#include "eigen_alias.h"
 #include <deform_surface.h>
 #include <Eigen/svd>
+#include <Eigen/Sparse>
+#include <fstream>
+#include <iostream>
+
+auto write_uv(const std::string& name, const VMat& uv, const FMat& F) {
+    std::ofstream file(name);
+    for (Eigen::Index i = 0; i < uv.rows(); ++i) {
+        file << "v " << uv(i, 0) << " " << uv(i, 1) <<  " " << uv(i, 2) << "\n";
+    }
+    for (Eigen::Index i = 0; i < F.rows(); ++i) {
+        file << "f " << F(i, 0) + 1 << " " << F(i, 1) + 1 << " " << F(i, 2) + 1 << "\n";
+    }
+    file.close();
+}
+
+void map_boundary_to_circle(VMat& V, const Eigen::Index n_boundary) {
+    auto V1 = V.topRows(n_boundary);
+    using IVec = Eigen::Matrix<Eigen::Index, Eigen::Dynamic, 1>;
+    IVec I = IVec::LinSpaced(n_boundary, 1, n_boundary);
+    I[n_boundary - 1] = 0;
+    auto L = (V1 - V1(I, Eigen::placeholders::all)).rowwise().norm().eval();
+    const auto l = L.sum();
+    const auto r = l / (2 * M_PI);
+    L /= l;
+    double theta = 0;
+    for (Eigen::Index i = 0; i < n_boundary; ++i) {
+        const auto temp = L(i);
+        L(i) = theta;
+        theta += temp;
+    }
+    L *= 2 * M_PI;
+    V1.col(0) = L.array().cos() * r;
+    V1.col(1) = L.array().sin() * r;
+    V1.col(2).setZero();
+
+    std::cout << "V1" << V1 << std::endl;
+}
 
 template<typename DerivedV1, typename DerivedV2, typename DerivedN>
 void cross(const Eigen::MatrixBase<DerivedV1>& V1, const Eigen::MatrixBase<DerivedV2>& V2, Eigen::MatrixBase<DerivedN>& N) {
@@ -49,12 +87,12 @@ auto tri_gradients(const Eigen::MatrixBase<DerivedV>& vertices, const Eigen::Mat
     return std::make_tuple(std::move(edge_bc), std::move(grad_phi0), std::move(normals), std::move(double_area), std::move(face_vertex_map), std::move(grad_rows));
 }
 
-auto build_system_pattern(const RowSpMat& DX, const Eigen::Index n_fixed) noexcept {
-    const Eigen::VectorXi I1 {0, 3};
-    const Eigen::VectorXi I2 {1, 4};
-    const Eigen::VectorXi I3 {2, 5};
+auto build_system_pattern1(const RowSpMat& DX, const Eigen::Index n_fixed) noexcept {
+    const Eigen::Vector2i I1 {0, 3};
+    const Eigen::Vector2i I2 {1, 4};
+    const Eigen::Vector2i I3 {2, 5};
     using IVec = Eigen::Matrix<RowSpMat::StorageIndex, 1, Eigen::Dynamic, Eigen::RowMajor>;
-    using Mat4 = Eigen::Matrix<RowSpMat::StorageIndex, 4, Eigen::Dynamic, Eigen::RowMajor>;
+    using Mat6 = Eigen::Matrix<RowSpMat::StorageIndex, 6, Eigen::Dynamic, Eigen::RowMajor>;
     const auto n_free = DX.innerSize() - n_fixed; // number of free vertices
     std::vector<RowSpMat::StorageIndex> pattern_outer(DX.outerSize() * 6 + 1); // row pointer for 4x block rows
     std::vector<RowSpMat::StorageIndex> pattern_inner(DX.nonZeros() * 6); // column indices for duplicated blocks
@@ -72,14 +110,14 @@ auto build_system_pattern(const RowSpMat& DX, const Eigen::Index n_fixed) noexce
         dx_start += skip_counts[i];
         const auto row_size = dx_end - dx_start; // free entries in this row
         const auto row_inner_indices = IVec::Map(dx_inner_ptr + dx_start, row_size).array(); // free vertex ids
-        auto block_indices = Mat4::Map(pattern_inner.data() + value_cursor, 6, row_size);
+        auto block_indices = Mat6::Map(pattern_inner.data() + value_cursor, 6, row_size);
 
         block_indices(I1, Eigen::placeholders::all) = (row_inner_indices - n_fixed).replicate<2, 1>();
         block_indices(I2, Eigen::placeholders::all) = (row_inner_indices + (n_free - n_fixed)).replicate<2, 1>();
         block_indices(I3, Eigen::placeholders::all) = (row_inner_indices +(2 * n_free - n_fixed)).replicate<2, 1>();
 
         IVec::Map(pattern_outer.data() + outer_cursor + 1, 6) = IVec::LinSpaced(6, value_cursor + row_size, value_cursor + row_size * 6);
-        value_cursor += row_size * 4;
+        value_cursor += row_size * 6;
         outer_cursor += 6;
     }
     pattern_inner.resize(value_cursor);
@@ -90,7 +128,7 @@ auto build_system_pattern(const RowSpMat& DX, const Eigen::Index n_fixed) noexce
 void fill_system_values(const RowSpMat& DX, const RowSpMat& DY, const VMat4& W, const std::vector<Eigen::Index>& skip_counts, const VMat& XYZ, RowSpMat& A, Eigen::VectorXd& boundary_rhs) noexcept {
     using RowValues = Eigen::Matrix<RowSpMat::Scalar, 1, Eigen::Dynamic>; // dense row view of gradient values
     using IndexRow = Eigen::Matrix<RowSpMat::StorageIndex, 1, Eigen::Dynamic, Eigen::RowMajor>; // row of vertex ids
-    using Block4 = Eigen::Matrix<RowSpMat::Scalar, 4, Eigen::Dynamic, Eigen::RowMajor>; // 4x face block of system
+    using Block6 = Eigen::Matrix<RowSpMat::Scalar, 6, Eigen::Dynamic, Eigen::RowMajor>; // 4x face block of system
     const auto row_ptr = A.outerIndexPtr(); // offsets into value/inner arrays
     boundary_rhs.setZero();
     for (Eigen::Index face = 0; face < DX.rows(); face++) {
@@ -105,24 +143,35 @@ void fill_system_values(const RowSpMat& DX, const RowSpMat& DY, const VMat4& W, 
         const auto w = W.row(face).reshaped(Eigen::fix<2>, Eigen::fix<2>);
         const auto dx_block = (w(0, 0) * dx_row + w(0, 1) * dy_row).eval();
         const auto dy_block = (w(1, 0) * dx_row + w(1, 1) * dy_row).eval();
-        auto block_values = Block4::Map(A.valuePtr() + block_start, 6, block_size); // target block in A
-        block_values.topRows(3).reshaped<Eigen::RowMajor>(3, block_size) = dx_block.replicate<3, 1>();
-        block_values.bottomRows(3).reshaped<Eigen::RowMajor>(3, block_size) = dy_block.replicate<3, 1>();
+        auto block_values = Block6::Map(A.valuePtr() + block_start, 6, block_size); // target block in A
+        block_values.topRows(3).rowwise() = dx_block.tail(block_size);
+        block_values.bottomRows(3).rowwise() = dy_block.tail(block_size);
 
         auto fixed_indices = IndexRow::Map(DX.innerIndexPtr() + DX.outerIndexPtr()[face], skip_counts[face]); // constrained vertex ids
-        auto fixed_XYZ = XYZ(fixed_indices, Eigen::placeholders::all).reshaped(); // their uv coords
-        // TODO:
+        auto fixed_XYZ = XYZ(fixed_indices, Eigen::placeholders::all);
 
         auto rhs_slice = boundary_rhs.segment(block_row, 6); // slice for this face
+        rhs_slice.segment(0, 3) += (dx_block.head(skip_counts[face]) * fixed_XYZ).transpose();
+        rhs_slice.segment(3, 3) += (dy_block.head(skip_counts[face]) * fixed_XYZ).transpose();
+    }
+}
 
-        rhs_slice.segment(0, 2) += dx_block.leftCols(skip_counts[face]).reshaped<Eigen::RowMajor>(2, skip_counts[face] * 2).matrix() * fixed_uv;
-        rhs_slice.segment(2, 2) += dy_block.leftCols(skip_counts[face]).reshaped<Eigen::RowMajor>(2, skip_counts[face] * 2).matrix() * fixed_uv;
+void assign_rhs(const VMat4& W, const VMat6& R, Eigen::VectorXd& rhs) noexcept {
+    Eigen::Index idx = 0;
+    for (Eigen::Index i = 0; i < W.rows(); ++i) {
+        rhs.segment(idx, 6).reshaped<Eigen::RowMajor>(Eigen::fix<2>, Eigen::fix<3>) =
+            W.row(i).reshaped(Eigen::fix<2>, Eigen::fix<2>)
+            * R.row(i).reshaped<Eigen::RowMajor>(Eigen::fix<2>, Eigen::fix<3>);
+        idx += 6;
     }
 }
 
 DeformSurface::DeformSurface(VMat&& vertices, FMat&& faces, const Eigen::Index n_fixed_vertices) : vertices(vertices), faces(faces), n_fixed_vertices(n_fixed_vertices) {}
 
 void DeformSurface::deform(const std::size_t n_iterations, VMat& new_vertices) {
+    new_vertices = this->vertices;
+    new_vertices.topRows(this->n_fixed_vertices).array() += 0.01;
+    // map_boundary_to_circle(new_vertices, this->n_fixed_vertices);
     using Mat23 = Eigen::Matrix<double, 2, 3>;
     Eigen::Index n_free = this->vertices.rows() - n_fixed_vertices;
     auto [B1, B2, N, DA, IFV, G] = tri_gradients(this->vertices, this->faces);
@@ -170,6 +219,7 @@ void DeformSurface::deform(const std::size_t n_iterations, VMat& new_vertices) {
     std::vector<Eigen::Index> skip_indices;
     RowSpMat A;
     Eigen::VectorXd boundary_rhs(B1.rows() * 6);
+    Eigen::VectorXd rhs(B1.rows() * 6);
 
     for (std::size_t _ = 0; _ < n_iterations; ++_) {
         update_jacobian(new_vertices);
@@ -187,11 +237,19 @@ void DeformSurface::deform(const std::size_t n_iterations, VMat& new_vertices) {
             W.row(i).reshaped(Eigen::fix<2>, Eigen::fix<2>) = svd.matrixU() * swi * svd.matrixU().transpose();
         }
         if (skip_indices.empty()) {
-            std::tie(A, skip_indices) = build_system_pattern(Du, n_fixed_vertices);
+            std::tie(A, skip_indices) = build_system_pattern1(Du, n_fixed_vertices);
         }
         fill_system_values(Du, Dv, W, skip_indices, new_vertices, A, boundary_rhs);
-        // assign_rhs(W, R, rhs);
-        // rhs -= boundary_rhs;
+        assign_rhs(W, R, rhs);
+        rhs -= boundary_rhs;
+
+        RowSpMat At = A.transpose();
+        RowSpMat L = At * DA.replicate<1, 6>().reshaped<Eigen::RowMajor>().asDiagonal() * A;
+        Eigen::VectorXd real_rhs = At * DA.replicate<1, 6>().reshaped<Eigen::RowMajor>().asDiagonal() * rhs;
+        Eigen::SimplicialLDLT<Eigen::SparseMatrix<double> > solver;
+        new_vertices.bottomRows(this->vertices.rows() - n_fixed_vertices).reshaped() = solver.compute(L).solve(real_rhs);
+        write_uv("output1.obj", new_vertices, this->faces);
+        const auto a = 2;
 
         // if (A_to_At_indices.size() == 0) {
         //     std::tie(At, A_to_At_indices) = transpose_sparse_matrix(A);

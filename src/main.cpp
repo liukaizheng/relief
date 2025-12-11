@@ -40,6 +40,7 @@
 #include <igl/per_face_normals.h>
 
 #include "flatten_surface.h"
+#include "deform_surface.h"
 #include "igl/PI.h"
 
 #include <algorithm>
@@ -1130,7 +1131,7 @@ auto get_top_boundary(const std::size_t grid_dimensioin, const MatXu& index_mat)
 
 } // namespace
 
-int main1(int argc, char** argv)
+int main(int argc, char** argv)
 {
     CLI::App app { "Relief App" };
     std::string mesh_path;
@@ -1191,6 +1192,13 @@ int main1(int argc, char** argv)
     auto [patch_points, patch_vertices, patch_faces] = extract_faces(mesh, faces, boundary_halfedges);
 
     auto fv_mat = mesh_to_eigen_mat(patch_points, patch_faces);
+
+    auto V1 = fv_mat.first;
+    auto F1 = fv_mat.second;
+    DeformSurface deform_surface(std::move(V1), std::move(F1), segment_offset.back());
+    auto new_vertices = V1;
+    deform_surface.deform(10, new_vertices);
+
     FlattenSurface flatten_surface(std::move(fv_mat.first), std::move(fv_mat.second), segment_offset);
     flatten_surface.slim_solve(10);
 
@@ -1222,7 +1230,7 @@ int main1(int argc, char** argv)
 
     return 0;
 }
- int main(int argc, char** argv) {
+ int main1(int argc, char** argv) {
      Eigen::Matrix2d uv;
      uv << 1, 0, 0, 1;
      using Mat23 = Eigen::Matrix<double, 2, 3>;
