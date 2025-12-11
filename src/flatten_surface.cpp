@@ -443,6 +443,29 @@ double flip_avoiding_line_search(const FMat& F, const VMat2& uv, VMat2& new_uv, 
 FlattenSurface::FlattenSurface(VMat &&V, FMat &&F, VMat2& uv, const std::size_t n_bnd_points) noexcept : V(std::move(V)), F(std::move(F)), uv(std::move(uv)), n_bnd_points(n_bnd_points) {
 }
 
+FlattenSurface::FlattenSurface(VMat &&V, FMat &&F, const std::size_t n_boundary_points) noexcept : V(std::move(V)), F(std::move(F)), n_bnd_points(0) {
+    uv.resize(this->V.rows(), 2);
+    IVec bnd = IVec::LinSpaced(n_boundary_points, 1, n_boundary_points);
+    bnd[n_boundary_points - 1] = 0;
+    auto L = (this->V.topRows(n_boundary_points) - this->V(bnd, Eigen::placeholders::all)).rowwise().norm().eval();
+    const auto l = L.sum();
+    const auto r = l / (2 * M_PI);
+    L /= l;
+    double theta = 0;
+    for (Eigen::Index i = 0; i < n_boundary_points; ++i) {
+        const auto temp = L(i);
+        L(i) = theta;
+        theta += temp;
+    }
+    L *= 2 * M_PI;
+
+    auto uv_slice = uv.topRows(n_boundary_points);
+    uv_slice.col(0) = L.array().cos() * r;
+    uv_slice.col(1) = L.array().sin() * r;
+
+    igl::harmonic(this->V, this->F, IVec::LinSpaced(n_boundary_points, 0, n_boundary_points - 1), uv_slice, 1, uv);
+}
+
 FlattenSurface::FlattenSurface(VMat&& V, FMat&& F, const std::vector<std::size_t>& segment_offsets) noexcept : V(std::move(V)), F(std::move(F)), n_bnd_points(segment_offsets.back()) {
     IVec I1;
     IVec I2;
