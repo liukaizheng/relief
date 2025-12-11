@@ -19,6 +19,7 @@
 
 #include <Eigen/Core>
 #include <array>
+#include <cstddef>
 #include <fmt/core.h>
 #include <fmt/format.h>
 #include <fmt/os.h>
@@ -38,10 +39,16 @@
 #include <igl/project_to_line_segment.h>
 #include <igl/triangle/triangulate.h>
 #include <igl/per_face_normals.h>
+#include <igl/read_triangle_mesh.h>
+#include <igl/boundary_loop.h>
+#include <igl/map_vertices_to_circle.h>
+#include <igl/flipped_triangles.h>
+#include <igl/write_triangle_mesh.h>
 
 #include "flatten_surface.h"
 #include "deform_surface.h"
-#include "igl/PI.h"
+#include "geometrycentral/surface/manifold_surface_mesh.h"
+#include "igl/harmonic.h"
 
 #include <algorithm>
 #include <cmath>
@@ -164,6 +171,15 @@ std::optional<Bounds> compute_bounds(Mesh& mesh)
     return Bounds { Kernel::Point_3(min_x, min_y, min_z),
         Kernel::Point_3(max_x, max_y, max_z) };
 }
+
+void scale_box(Eigen::Vector2d& min_pt, Eigen::Vector2d& max_pt, const double s)
+{
+    const auto center = ((min_pt + max_pt) * 0.5).eval();
+    const auto vec = ((max_pt - center) * s).eval();
+    max_pt = center + vec;
+    min_pt = center - vec;
+}
+
 
 std::size_t remove_faces_on_min_plane(Mesh& mesh, double min_z,
     double tolerance)
@@ -586,6 +602,54 @@ auto insert_point_into_mesh(
     }
 }
 
+auto trace_bounding_box_outline1(
+    const std::string& input_mesh_path,
+    Eigen::Vector2d bounding_min,
+    Eigen::Vector2d bounding_max,
+    const std::size_t center_vid
+) {
+    auto [gmesh, geom] = gs::readManifoldSurfaceMesh(input_mesh_path);
+    std::vector<Point_3> points;
+    std::vector<std::vector<std::size_t>> faces;
+    for (const auto& vid : gmesh->vertices()) {
+        const auto& pt = geom->vertexPositions[vid];
+        points.emplace_back(pt.x, pt.y, pt.z);
+    }
+    for (const auto& fid : gmesh->faces()) {
+        std::vector<std::size_t> face;
+        for (const auto vid : fid.adjacentVertices()) {
+            face.emplace_back(vid.getIndex());
+        }
+        faces.emplace_back(face);
+    }
+    Mesh mesh;
+    PMP::polygon_soup_to_polygon_mesh(points, faces, mesh);
+
+    const auto center_vertex = gmesh->vertex(center_vid);
+    std::vector<Eigen::Vector2d, Eigen::aligned_allocator<Eigen::Vector2d>> bounding_box_corners { bounding_min};
+    const auto bounding_box_center = ((bounding_min + bounding_max) * 0.5).eval();
+
+    constexpr double scale_factor = 1.2;
+    scale_box(bounding_min, bounding_min, scale_factor);
+
+    bounding_box_corners.emplace_back(bounding_min);
+    bounding_box_corners.emplace_back(Eigen::Vector2d{ bounding_max.x(), bounding_min.y() });
+    bounding_box_corners.emplace_back(bounding_max);
+    bounding_box_corners.emplace_back(Eigen::Vector2d{ bounding_min.x(), bounding_max.y() });
+
+    std::unordered_map<EI, std::vector<std::size_t>> outline_edge_points_map;
+    std::unordered_map<FI, std::vector<std::size_t>> outline_face_points_map;
+    std::vector<Point_3> outline_points;
+    std::vector<VI> outline_vertex_indices;
+    for (const auto& corner : bounding_box_corners) {
+        const auto dir = (corner - bounding_box_center).eval();
+        const auto trace_result = gs::traceGeodesic(*geom, center_vertex, geometrycentral::Vector2 { dir[0], dir[1] }, { .includePath = true });
+        record_boundary_point(trace_result.endPoint, geom->vertexPositions, mesh, outline_points, outline_vertex_indices, outline_edge_points_map, outline_face_points_map);
+    }
+    insert_point_into_mesh(mesh, outline_points, outline_vertex_indices, outline_edge_points_map, outline_face_points_map);
+    return std::make_tuple(std::move(mesh), std::move(outline_vertex_indices));
+}
+
 auto trace_bounding_box_outline(const std::string& mesh_path, Eigen::Vector2d bounding_min, Eigen::Vector2d bounding_max, const std::size_t samples_per_edge)
 {
     auto [gmesh, geometry] = gs::readManifoldSurfaceMesh(mesh_path);
@@ -612,8 +676,10 @@ auto trace_bounding_box_outline(const std::string& mesh_path, Eigen::Vector2d bo
 
     // gs::SurfacePoint geodesic_seed_vertex(gmesh->vertex(7008));
     gs::SurfacePoint geodesic_seed_vertex(gmesh->vertex(6714));
+
     const auto bounding_box_center = ((bounding_min + bounding_max) * 0.5).eval();
     std::vector<Eigen::Vector2d, Eigen::aligned_allocator<Eigen::Vector2d>> bounding_box_corners { bounding_min, { bounding_max.x(), bounding_min.y() }, bounding_max, { bounding_min.x(), bounding_max.y() } };
+
     std::vector<Point_3> outline_points;
     std::vector<VI> outline_vertex_indices;
     outline_points.reserve(samples_per_edge * 4);
@@ -689,6 +755,36 @@ auto split_face_and_return_edge(
         }
         return split_halfedge;
     }
+}
+
+auto embed_planar_grid_boundary1(
+    const std::string& input_mesh_path,
+    const Eigen::Vector2d& grid_min_corner,
+    const Eigen::Vector2d& grid_max_corner
+){
+
+    // 7008, 6714
+    auto [cgal_mesh, initial_boundary_indices] = trace_bounding_box_outline1(input_mesh_path, grid_min_corner, grid_max_corner, 6714);
+    const auto vertex_positions = cgal_mesh.points() | view_ts([](const auto& p) { return GV3 { p.x(), p.y(), p.z() }; }) | std::ranges::to<std::vector>();
+    const auto mesh_faces = cgal_mesh.faces() | view_ts([&](const auto fid) { return cgal_mesh.vertices_around_face(cgal_mesh.halfedge(fid)) | view_ts([](const auto vid) { return (std::size_t)vid.idx(); }) | std::ranges::to<std::vector>(); }) | std::ranges::to<std::vector>();
+    auto [gc_mesh, gc_geometry] = gs::makeManifoldSurfaceMeshAndGeometry(mesh_faces, vertex_positions);
+    const auto boundary_vertices_gc = initial_boundary_indices | std::views::drop(1) | view_ts([&gc_mesh](const auto vid) { return gc_mesh->vertex(vid.idx()); }) | std::ranges::to<std::vector>();
+
+    gs::VertexData<bool> is_boundary_vertex(*gc_mesh, false);
+    for (const auto& vid : boundary_vertices_gc) {
+        is_boundary_vertex[vid] = true;
+    }
+
+    std::vector<std::vector<gs::Halfedge>> initial_paths;
+    for (std::size_t i = 0; i < boundary_vertices_gc.size(); i++) {
+        const auto j = (i + 1) % boundary_vertices_gc.size();
+        initial_paths.push_back(gs::shortestEdgePathAvoidingMarkedVertices(*gc_geometry, boundary_vertices_gc[i], boundary_vertices_gc[j], is_boundary_vertex));
+    }
+
+    gs::FlipEdgeNetwork flip_network(*gc_mesh, *gc_geometry, initial_paths, is_boundary_vertex);
+    flip_network.straightenAroundMarkedVertices = false;
+    flip_network.iterativeShorten();
+    const auto& optimized_paths = flip_network.getPathPolyline();
 }
 
 auto embed_planar_grid_boundary(const std::string& input_mesh_path, const Eigen::Vector2d& grid_min_corner, const Eigen::Vector2d& grid_max_corner, std::size_t boundary_samples_per_edge, std::size_t grid_cells_per_axis)
@@ -784,14 +880,6 @@ auto surround_faces(const Mesh& mesh, const std::vector<Mesh ::Halfedge_index>& 
         }
     }
     return faces;
-}
-
-void scale_box(Eigen::Vector2d& min_pt, Eigen::Vector2d& max_pt, const double s)
-{
-    const auto center = ((min_pt + max_pt) * 0.5).eval();
-    const auto vec = ((max_pt - center) * s).eval();
-    max_pt = center + vec;
-    min_pt = center - vec;
 }
 
 auto extract_faces(const Mesh& mesh, const std::vector<FI>& faces, std::vector<HI>& boundary_halfedges)
@@ -1195,12 +1283,15 @@ int main(int argc, char** argv)
 
     auto V1 = fv_mat.first;
     auto F1 = fv_mat.second;
-    DeformSurface deform_surface(std::move(V1), std::move(F1), segment_offset.back());
-    auto new_vertices = V1;
-    deform_surface.deform(10, new_vertices);
 
     FlattenSurface flatten_surface(std::move(fv_mat.first), std::move(fv_mat.second), segment_offset);
     flatten_surface.slim_solve(10);
+    DeformSurface deform_surface(std::move(V1), std::move(F1), segment_offset.back());
+    auto new_vertices = V1;
+    // new_vertices.leftCols(2) = flatten_surface.uv;
+    // new_vertices.rightCols(1).setZero();
+    // new_vertices.col(2).tail(new_vertices.rows() - segment_offset.back()).setRandom();
+    deform_surface.deform(10, new_vertices);
 
     VMat N;
     igl::per_face_normals(flatten_surface.V, flatten_surface.F, N);
@@ -1230,33 +1321,51 @@ int main(int argc, char** argv)
 
     return 0;
 }
+
  int main1(int argc, char** argv) {
-     Eigen::Matrix2d uv;
-     uv << 1, 0, 0, 1;
-     using Mat23 = Eigen::Matrix<double, 2, 3>;
-     Mat23 X;
-     X << 1, 0, 0,
-          1, 1, 1;
+     VMat V;
+     FMat F;
+     igl::read_triangle_mesh("face.obj", V, F);
+     Eigen::MatrixXi F1 = F.cast<int>();
+     Eigen::VectorXi bnd;
 
-     Eigen::Vector3d axis = Eigen::Vector3d::Random();
-     axis.normalize();
+     igl::boundary_loop(F1, bnd);
+     Eigen::VectorXi map(V.rows());
+     const auto INVALID = V.rows();
+     map.setConstant(INVALID);
 
-     Eigen::Transform<double, 3, Eigen::Affine> t(Eigen::AngleAxis(igl::PI / 6.0, axis));
-     X.row(0).transpose() = t * X.row(0).transpose();
-     X.row(1).transpose() = t * X.row(1).transpose();
+     map(bnd) = Eigen::VectorXi::LinSpaced(bnd.size(), 0, bnd.size() - 1);
+     Eigen::Index count = bnd.size();
+     for (Eigen::Index i = 0; i < V.rows(); ++i) {
+         if (map(i) == INVALID) {
+             map[i] = count++;
+         }
+     }
+     VMat V1 = V;
+     V(map, Eigen::placeholders::all) = V1;
+     F.col(0) = map(F.col(0)).cast<std::size_t>();
+     F.col(1) = map(F.col(1)).cast<std::size_t>();
+     F.col(2) = map(F.col(2)).cast<std::size_t>();
 
-     Eigen::JacobiSVD<Mat23, Eigen::ComputeFullU | Eigen::ComputeFullV> svd(X);
+     igl::write_triangle_mesh("mesh2.obj", V, F.cast<int>());
 
-     auto U = svd.matrixU();
-     auto V = svd.matrixV();
-     auto S = svd.singularValues();
+     bnd = Eigen::VectorXi::LinSpaced(bnd.size(), 0, bnd.size() - 1);
+     Eigen::MatrixXd bnd_uv, uv;
+     igl::map_vertices_to_circle(V, bnd, bnd_uv);
+     igl::harmonic(V,F,bnd,bnd_uv,1,uv);
+     if (igl::flipped_triangles(uv,F).size() != 0) {
+       igl::harmonic(F,bnd,bnd_uv,1,uv); // use uniform laplacian
+     }
 
-     Mat23 D = (U * S.asDiagonal() * V.transpose().topRows(2) -  X).eval();
+     VMat newV = V;
+     newV.setZero();
+     newV.leftCols(2) = uv;
 
-     std::cout << "Transformed Matrix X:\n" << X << std::endl;
-     std::cout << "matrix U:\n" << svd.matrixU() << std::endl;
-     std::cout << "matrix V:\n" << svd.matrixV() << std::endl;
-     std::cout << "singular values:\n" << svd.singularValues() << std::endl;
-     std::cout << "matrix D:\n" << D << std::endl;
+     // DeformSurface ds(std::move(V), std::move(F), bnd.size());
+     // ds.deform(10, newV);
+     VMat2 uv1 = uv;
+     FlattenSurface fs(std::move(V), std::move(F), uv1, 0);
+     fs.slim_solve(10);
+
      return 0;
  }

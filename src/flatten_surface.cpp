@@ -1,6 +1,7 @@
 #include "flatten_surface.h"
 #include <igl/harmonic.h>
 #include <igl/polar_svd.h>
+#include <fmt/format.h>
 
 # include <algorithm>
 
@@ -439,6 +440,8 @@ double flip_avoiding_line_search(const FMat& F, const VMat2& uv, VMat2& new_uv, 
     const auto t = get_min_pos_root_2D(F, uv, d);
     return line_search(uv, d, new_uv, compute_energy, energy, t);
 }
+FlattenSurface::FlattenSurface(VMat &&V, FMat &&F, VMat2& uv, const std::size_t n_bnd_points) noexcept : V(std::move(V)), F(std::move(F)), uv(std::move(uv)), n_bnd_points(n_bnd_points) {
+}
 
 FlattenSurface::FlattenSurface(VMat&& V, FMat&& F, const std::vector<std::size_t>& segment_offsets) noexcept : V(std::move(V)), F(std::move(F)), n_bnd_points(segment_offsets.back()) {
     IVec I1;
@@ -605,6 +608,6 @@ void FlattenSurface::slim_solve(const std::size_t n_iterations) {
         uv = new_uv;
         std::cout << "Energy: " << energy << std::endl;
 
-        write_uv("uv_new.obj", new_uv, F);
     }
+    write_uv(fmt::format("uv_new.obj"), new_uv, F);
 }

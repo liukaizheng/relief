@@ -4,6 +4,7 @@
 #include <Eigen/Sparse>
 #include <fstream>
 #include <iostream>
+#include <fmt/format.h>
 
 auto write_uv(const std::string& name, const VMat& uv, const FMat& F) {
     std::ofstream file(name);
@@ -169,9 +170,10 @@ void assign_rhs(const VMat4& W, const VMat6& R, Eigen::VectorXd& rhs) noexcept {
 DeformSurface::DeformSurface(VMat&& vertices, FMat&& faces, const Eigen::Index n_fixed_vertices) : vertices(vertices), faces(faces), n_fixed_vertices(n_fixed_vertices) {}
 
 void DeformSurface::deform(const std::size_t n_iterations, VMat& new_vertices) {
-    new_vertices = this->vertices;
-    new_vertices.topRows(this->n_fixed_vertices).array() += 0.01;
+    // new_vertices = this->vertices;
+    // new_vertices.topRows(this->n_fixed_vertices).array() -= 0.1;
     // map_boundary_to_circle(new_vertices, this->n_fixed_vertices);
+    write_uv("output0.obj", new_vertices, faces);
     using Mat23 = Eigen::Matrix<double, 2, 3>;
     Eigen::Index n_free = this->vertices.rows() - n_fixed_vertices;
     auto [B1, B2, N, DA, IFV, G] = tri_gradients(this->vertices, this->faces);
@@ -230,6 +232,7 @@ void DeformSurface::deform(const std::size_t n_iterations, VMat& new_vertices) {
             Eigen::JacobiSVD<decltype(ji), Eigen::ComputeFullU | Eigen::ComputeFullV> svd(ji);
 
             const auto si = svd.singularValues().array();
+            // std::cout << si.transpose() << std::endl;
 
             // const auto si_arr = si.array();
             auto swi = (((1.0 + si) / si * (1.0 + si.square())).sqrt() / si).matrix().asDiagonal();
@@ -248,7 +251,7 @@ void DeformSurface::deform(const std::size_t n_iterations, VMat& new_vertices) {
         Eigen::VectorXd real_rhs = At * DA.replicate<1, 6>().reshaped<Eigen::RowMajor>().asDiagonal() * rhs;
         Eigen::SimplicialLDLT<Eigen::SparseMatrix<double> > solver;
         new_vertices.bottomRows(this->vertices.rows() - n_fixed_vertices).reshaped() = solver.compute(L).solve(real_rhs);
-        write_uv("output1.obj", new_vertices, this->faces);
+        write_uv(fmt::format("output{}.obj", _), new_vertices, this->faces);
         const auto a = 2;
 
         // if (A_to_At_indices.size() == 0) {
