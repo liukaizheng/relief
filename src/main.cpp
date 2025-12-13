@@ -20,6 +20,7 @@
 #include <Eigen/Core>
 #include <array>
 #include <cstddef>
+#include <cstdio>
 #include <fmt/core.h>
 #include <fmt/format.h>
 #include <fmt/os.h>
@@ -47,8 +48,10 @@
 
 #include "eigen_alias.h"
 #include "flatten_surface.h"
-#include "deform_surface.h"
+#include "geometrycentral/surface/barycentric_vector.h"
 #include "geometrycentral/surface/manifold_surface_mesh.h"
+#include "geometrycentral/surface/vertex_position_geometry.h"
+#include "geometrycentral/utilities/utilities.h"
 #include "igl/harmonic.h"
 
 #include <algorithm>
@@ -152,18 +155,14 @@ auto write_mesh2(const std::string& name, const Mesh_2& mesh)
 }
 
 void compute_bary_coordinates(
-    const std::vector<Point_2>& all_points,
-    const FMat& F,
-    const std::size_t fid,
+    const Point_2& pa,
+    const Point_2& pb,
+    const Point_2& pc,
     const std::vector<Point_2>& points,
     const std::vector<std::size_t>& point_indices,
-    std::vector<double> bary_coordinates
+    std::vector<double>& bary_coordinates
 ) {
     auto B = VMat::Map(bary_coordinates.data(), bary_coordinates.size() / 3, 3);
-    const auto f = F.row(fid);
-    const auto& pa = all_points[f[0]];
-    const auto& pb = all_points[f[1]];
-    const auto& pc = all_points[f[2]];
 
     const auto v0 = pb - pa;
     const auto v1 = pc - pa;
@@ -260,6 +259,30 @@ std::size_t remove_faces_on_min_plane(Mesh& mesh, double min_z,
     return faces_to_remove.size();
 }
 
+void write_halfedges(
+    const std::string& name,
+    gs::ManifoldSurfaceMesh& mesh,
+    gs::VertexPositionGeometry& geom,
+    const std::vector<gs::Halfedge>& halfedges
+) {
+    auto out = fmt::output_file(name);
+    for (const auto& halfedge : halfedges) {
+        const auto& source = halfedge.tailVertex();
+        const auto& source_point = geom.vertexPositions[source];
+        out.print("v {} {} {}\n", source_point.x, source_point.y, source_point.z);
+    }
+    const auto& he = halfedges.back();
+    const auto& target = he.tipVertex();
+    const auto& target_point = geom.vertexPositions[target];
+    out.print("v {} {} {}\n", target_point.x, target_point.y, target_point.z);
+
+    for (std::size_t i = 0; i < halfedges.size(); i++) {
+        const auto j = i + 1;
+        out.print("l {} {}\n", i + 1, j + 1);
+    }
+    out.close();
+}
+
 void write_polyline(const std::string& name, const std::vector<gs::SurfacePoint>& points, gs::VertexData<geometrycentral::Vector3>& vertexData)
 {
     auto out = fmt::output_file(name);
@@ -277,7 +300,7 @@ void write_polyline(const std::string& name, const std::vector<gs::SurfacePoint>
 template <typename Point>
 void split_edges(
     CGAL::Surface_mesh<Point>& mesh,
-    std::unordered_map<EI, std::vector<std::size_t>>& edge_points_map,
+    const std::unordered_map<EI, std::vector<std::size_t>>& edge_points_map,
     const std::vector<Point>& points,
     std::vector<VI>& point_vertex_indices,
     const double tol)
@@ -330,6 +353,39 @@ auto record_boundary_point(
     const auto pos = surface_point.interpolate(vertex_positions);
     const auto point_idx = inserted_points.size();
     inserted_points.emplace_back(pos.x, pos.y, pos.z);
+    switch (surface_point.type) {
+    case gs::SurfacePointType::Vertex: {
+        point_vertex_handles.emplace_back(VI(surface_point.vertex.getIndex()));
+        break;
+    }
+    case gs::SurfacePointType::Edge: {
+        auto [va, vb] = surface_point.edge.adjacentVertices();
+        const auto eid = target_mesh.edge(target_mesh.halfedge(VI(va.getIndex()), VI(vb.getIndex())));
+        edge_split_map[eid].emplace_back(point_idx);
+        point_vertex_handles.emplace_back();
+        break;
+    }
+    case gs::SurfacePointType::Face: {
+        face_split_map[FI(surface_point.face.getIndex())].emplace_back(point_idx);
+        point_vertex_handles.emplace_back();
+        break;
+    }
+    }
+}
+
+auto record_boundary_point_2d(
+    const gs::SurfacePoint& surface_point,
+    const gs::VertexData<geometrycentral::Vector3>& vertex_positions,
+    const Mesh_2& target_mesh,
+    std::vector<Point_2>& inserted_points,
+    std::vector<VI>& point_vertex_handles,
+    std::unordered_map<EI, std::vector<std::size_t>>& edge_split_map,
+    std::unordered_map<FI, std::vector<std::size_t>>& face_split_map)
+{
+
+    const auto pos = surface_point.interpolate(vertex_positions);
+    const auto point_idx = inserted_points.size();
+    inserted_points.emplace_back(pos.x, pos.y);
     switch (surface_point.type) {
     case gs::SurfacePointType::Vertex: {
         point_vertex_handles.emplace_back(VI(surface_point.vertex.getIndex()));
@@ -536,8 +592,6 @@ void triangualte_on_face1(
         point_vertex_indices[pid] = VI(vid);
         vertices.emplace_back(vid);
     }
-    bary_coordinates.resize(points.size() * 3);
-
 
     VMat2 V(vertices.size(), 2);
     for (std::size_t i = 0; i < vertices.size(); ++i) {
@@ -566,15 +620,11 @@ void triangualte_on_face1(
 
     if (!face_point_indices.empty()) {
         const auto fv = F.row(real_fid);
-        Eigen::RowVector2d p1(points[fv[0]].x(), points[fv[0]].y());
-        Eigen::RowVector2d p2(points[fv[1]].x(), points[fv[1]].y());
-        Eigen::RowVector2d p3(points[fv[2]].x(), points[fv[2]].y());
+        const auto& pa = mesh.point(VI(fv[0]));
+        const auto& pb = mesh.point(VI(fv[1]));
+        const auto& pc = mesh.point(VI(fv[2]));
 
-        auto I = IVec::LinSpaced(face_point_indices.size(), n_old_vertices, vertices.size() - 1).eval();
-        Eigen::MatrixXd B;
-        igl::barycentric_coordinates(V(I, Eigen::placeholders::all), p1.replicate(I.size(), 1), p2.replicate(I.size(), 1), p3.replicate(I.size(), 1), B);
-        auto bary_map = Eigen::Matrix<double, Eigen::Dynamic, 3>::Map(bary_coordinates.data() + n_old_points * 3, face_point_indices.size(), 3);
-        bary_map = B;
+        compute_bary_coordinates(pa, pb, pc, face_points, face_point_indices, bary_coordinates);
     }
 }
 
@@ -875,8 +925,10 @@ auto trace_bounding_box_outline(const std::string& mesh_path, Eigen::Vector2d bo
     // CGAL::IO::write_polygon_mesh("mesh1.obj", mesh);
     return std::make_pair(std::move(outline_vertex_indices), std::move(mesh));
 }
+
+template<typename P>
 auto split_face_and_return_edge(
-    Mesh& target_mesh,
+    CGAL::Surface_mesh<P>& target_mesh,
     const VI start_vertex,
     const VI end_vertex,
     const std::size_t original_vertex_threshold)
@@ -1162,7 +1214,165 @@ void locate_points_on_face1(
     }
     face_points.resize(idx);
 }
-auto add_points_into_mesh(Mesh_2& mesh, std::vector<Point_2>& points, const double tol) {
+
+auto add_outline(
+    const std::vector<Point_2>& points,
+    const std::vector<std::vector<std::size_t>>& faces,
+    Mesh_2& mesh,
+    const std::vector<VI>& boundary_vertices,
+    const std::vector<std::size_t>& face_map,
+    const std::size_t grid_dimension,
+    const std::vector<Point_2>& relief_points,
+    const std::vector<std::size_t>& relief_boundary_point_indices,
+    std::vector<std::size_t>& relief_vertex_indices,
+    const double tol
+) {
+
+    const auto points_3d = points | view_ts([] (const Point_2& p) { return GV3(p.x(), p.y(), 0.0); }) | std::ranges::to<std::vector>();
+    auto [gc_mesh, gc_geometry] = gs::makeManifoldSurfaceMeshAndGeometry(faces, points_3d);
+    const auto gc_boundary_vertices = boundary_vertices | view_ts([&] (const VI vid) {return gc_mesh->vertex(vid.id());}) | std::ranges::to<std::vector>();
+    gs::VertexData<bool> is_boundary_vertex(*gc_mesh, false);
+    for (const auto& vid : boundary_vertices) {
+        is_boundary_vertex[vid] = true;
+    }
+
+    // std::vector<std::vector<gs::Halfedge>> initial_paths;
+    std::vector<gs::SurfacePoint> outline;
+    std::vector<std::size_t> separators{0};
+    for (std::size_t i = 0; i < boundary_vertices.size(); i++) {
+        const auto j = (i + 1) % boundary_vertices.size();
+        auto initial_path = gs::shortestEdgePathAvoidingMarkedVertices(*gc_geometry, gc_boundary_vertices[i], gc_boundary_vertices[j], is_boundary_vertex);
+        gs::FlipEdgeNetwork flip_network(*gc_mesh, *gc_geometry, {initial_path}, is_boundary_vertex);
+        flip_network.straightenAroundMarkedVertices = false;
+        flip_network.iterativeShorten();
+        const auto paths = flip_network.getPathPolyline();
+        const auto& path = paths[0];
+        outline.append_range(path | std::views::take(path.size() - 1));
+        separators.emplace_back(outline.size());
+    }
+
+    std::vector<std::size_t> point_faces(outline.size());
+    for (std::size_t i = 0; i < outline.size(); i++) {
+        const auto srf_pt = outline[i].inSomeFace();
+        point_faces[i] = face_map[srf_pt.face.getIndex()];
+    }
+
+    std::vector<std::size_t> boundary_halfedge_faces(outline.size());
+    for (std::size_t i = 0; i < outline.size(); i++) {
+        const auto j = (i + 1) % outline.size();
+        const auto& pa = outline[i];
+        const auto& pb = outline[j];
+        const auto shared_face = gs::sharedFace(pa, pb);
+        if (shared_face.getIndex() == geometrycentral::INVALID_IND) {
+            fmt::println(stderr, "No shared face found between points {} and {}", i, j);
+        } else {
+            boundary_halfedge_faces[i] = face_map[shared_face.getIndex()];
+        }
+    }
+
+    std::vector<Point_2> new_points;
+    std::vector<VI> point_vertices;
+    std::unordered_map<EI, std::vector<std::size_t>> edge_split_points;
+    std::unordered_map<FI, std::vector<std::size_t>> face_split_points;
+    for (const auto& pt : outline) {
+        record_boundary_point_2d(pt, gc_geometry->vertexPositions, mesh, new_points, point_vertices, edge_split_points, face_split_points);
+    }
+    const auto n_old_points = mesh.num_vertices();
+    split_edges(mesh, edge_split_points, new_points, point_vertices, tol);
+    for (std::size_t i = 0; i < outline.size(); i++) {
+        const auto va = point_vertices[i];
+        const auto vb = point_vertices[(i + 1) % outline.size()];
+        split_face_and_return_edge(mesh, va, vb, n_old_points);
+    }
+    // write_mesh2("mesh2.obj", mesh);
+    std::vector<double> boundary_edge_length(outline.size());
+    for (std::size_t i = 0; i < outline.size(); i++) {
+        const auto& pa = new_points[i];
+        const auto& pb = new_points[(i + 1) % outline.size()];
+        const auto v = pa - pb;
+        boundary_edge_length[i] = std::sqrt(v * v);
+    }
+    std::vector<Point_2> mesh_points;
+    mesh_points.append_range(mesh.points());
+
+    std::vector<std::vector<std::size_t>> edge_point_indices;
+    for (std::size_t i = 0; i < boundary_vertices.size(); i++) {
+        std::vector<double> grid_edge_lengths;
+        grid_edge_lengths.reserve(separators[i + 1] - separators[i] + 1);
+        grid_edge_lengths.emplace_back(0.0);
+        for (std::size_t j = separators[i]; j < separators[i + 1]; j++) {
+            grid_edge_lengths.emplace_back(grid_edge_lengths.back() + boundary_edge_length[j]);
+        }
+        const auto stride = grid_edge_lengths.back() / (grid_dimension - 1);
+        double curr_len = 0.0;
+        std::size_t i1 = 0;
+        const auto start = i * (grid_dimension - 1);
+        const auto end = (i + 1) * (grid_dimension - 1);
+        for (std::size_t i2 = start; i2 < end; i2++) {
+            const auto relief_pid = relief_boundary_point_indices[i2];
+            while(grid_edge_lengths[i1] + tol < curr_len) {
+                i1 += 1;
+            }
+            if (std::abs(grid_edge_lengths[i1] - curr_len) < tol) {
+                relief_vertex_indices[relief_pid] = point_vertices[separators[i] + i1];
+            } else {
+                const auto vid = mesh_points.size();
+                relief_vertex_indices[relief_pid] = vid;
+                const auto& pt = relief_points[relief_pid];
+                new_points.emplace_back(pt);
+                mesh_points.emplace_back(pt);
+                point_vertices.push_back(VI(vid));
+                const auto edge_index = separators[i] + i1 - 1;
+                point_faces.emplace_back(boundary_halfedge_faces[edge_index]);
+            }
+            curr_len += stride;
+        }
+    }
+
+    const auto a = 2;
+}
+
+auto generate_grid(const std::vector<Point_2>& corner_points, const std::size_t grid_dimension) {
+    auto v1 = corner_points[1] - corner_points[0];
+    const auto len = std::sqrt(v1 * v1);
+    v1 /= len;
+    Eigen::Matrix2d rot;
+    rot << v1[0], -v1[1], v1[1], v1[0];
+    VMat2 V(grid_dimension * grid_dimension, 2);
+    MatXu I(grid_dimension, grid_dimension);
+    const auto X = Eigen::VectorXd::LinSpaced(grid_dimension, 0.0, len).eval();
+    V.col(0).reshaped<Eigen::RowMajor>(grid_dimension, grid_dimension).rowwise() = X.transpose();
+    V.col(1).reshaped<Eigen::RowMajor>(grid_dimension, grid_dimension).colwise() = X;
+    V.transpose() = (rot * V.transpose()).eval();
+    V.rowwise() += Eigen::RowVector2d{corner_points[0][0], corner_points[0][1]};
+
+    FMat F;
+    write_uv("grid.obj", V, F);
+
+    std::size_t count = 0;
+    for (std::size_t j = 0; j < X.size(); ++j) {
+        for (std::size_t i = 0; i < X.size(); ++i) {
+            I(i, j) = count++;
+        }
+    }
+
+    const auto n_points = grid_dimension - 1;
+    std::vector<std::size_t> boundary_point_indices(n_points * 4);
+    IVec::Map(boundary_point_indices.data(), n_points) = IVec::LinSpaced(n_points, 0, n_points - 1);
+    IVec::Map(boundary_point_indices.data() + n_points, n_points) = IVec::LinSpaced(n_points, n_points, n_points + (n_points - 1) * grid_dimension);
+    IVec::Map(boundary_point_indices.data() + 2 * n_points, n_points).reverse() = IVec::LinSpaced(n_points, n_points * grid_dimension + 1, grid_dimension * grid_dimension - 1);
+    IVec::Map(boundary_point_indices.data() + 3 * n_points, n_points).reverse() = IVec::LinSpaced(n_points, grid_dimension, n_points * grid_dimension);
+    std::vector<Point_2> points;
+    points.reserve(V.rows());
+    for (Eigen::Index i = 0; i < V.rows(); ++i) {
+        points.emplace_back(V(i, 0), V(i, 1));
+    }
+
+    return std::make_tuple(std::move(points), std::move(boundary_point_indices));
+}
+
+auto add_points_into_mesh(Mesh_2& mesh, std::vector<Point_2>& corner_points, const std::size_t grid_dimension, const double tol) {
+    auto[relief_points, relief_boundary_point_indices] = generate_grid(corner_points, grid_dimension);
     std::vector<Triangle_2> triangles;
     triangles.reserve(mesh.number_of_faces());
     for (const auto fid : mesh.faces()) {
@@ -1177,10 +1387,9 @@ auto add_points_into_mesh(Mesh_2& mesh, std::vector<Point_2>& points, const doub
     Tree tree(triangles.begin(), triangles.end());
     tree.accelerate_distance_queries();
     std::unordered_map<std::size_t, std::vector<std::size_t>> face_points_map(mesh.num_faces());
-    face_points_map.reserve(mesh.num_faces());
-    IVec point_faces(points.size());
-    for (std::size_t i = 0; i < points.size(); ++i) {
-        auto res = tree.closest_point_and_primitive(points[i]);
+    IVec point_faces(corner_points.size());
+    for (std::size_t i = 0; i < corner_points.size(); ++i) {
+        auto res = tree.closest_point_and_primitive(corner_points[i]);
         const auto fid = res.second - triangles.begin();
         point_faces[i] = fid;
         face_points_map[fid].push_back(i);
@@ -1194,77 +1403,58 @@ auto add_points_into_mesh(Mesh_2& mesh, std::vector<Point_2>& points, const doub
 
         F.row(fid.id()) << mesh.source(h1).id(), mesh.source(h2).id(), mesh.source(h3).id();
     }
+
     const std::size_t n_old_vertices = mesh.number_of_vertices();
 
-    std::vector<VI> point_vertex_indices(points.size());
+    std::vector<VI> point_vertex_indices(corner_points.size());
     std::unordered_map<EI, std::vector<std::size_t>> edge_points_map;
-    std::vector<double> point_bary_coords(points.size() * 3, 0.0);
+    std::vector<double> point_bary_coords(corner_points.size() * 3, 0.0);
     for (auto& [fid, face_point_indices] : face_points_map) {
-        locate_points_on_face1(mesh, points, FI(fid), face_point_indices, edge_points_map, point_vertex_indices, point_bary_coords, tol * tol);
+        locate_points_on_face1(mesh, corner_points, FI(fid), face_point_indices, edge_points_map, point_vertex_indices, point_bary_coords, tol * tol);
+    }
+    split_edges(mesh, edge_points_map, corner_points, point_vertex_indices, tol); // notices: assume no points on edges
+    for (const auto& [eid, edge_point_indices] : edge_points_map) {
+        const auto fid = point_faces[edge_point_indices[0]];
+        const auto& pa = mesh.point(VI(F(fid, 0)));
+        const auto& pb = mesh.point(VI(F(fid, 1)));
+        const auto& pc = mesh.point(VI(F(fid, 2)));
+        compute_bary_coordinates(pa, pb, pc, corner_points, edge_point_indices, point_bary_coords);
+        for (const auto pid : edge_point_indices) {
+            point_faces[pid] = fid;
+        }
     }
 
-    split_edges(mesh, edge_points_map, points, point_vertex_indices, tol); // notices: assume no points on edges
-    std::vector<std::vector<std::size_t>> new_faces;
     std::vector<Point_2> mesh_points;
-    std::vector<std::size_t> face_evolutions;
     mesh_points.append_range(mesh.points());
+    std::vector<std::vector<std::size_t>> new_faces;
+    std::vector<std::size_t> face_evolutions;
     for (const auto fid : mesh.faces()) {
         const auto it = face_points_map.find(fid);
         if (it == face_points_map.end()) {
-            triangualte_on_face(mesh, FI(fid), mesh_points, points, {}, point_vertex_indices, new_faces, F, bary_centers);
+            triangualte_on_face1(mesh, FI(fid), fid, mesh_points, corner_points, {}, point_vertex_indices, new_faces, F, point_bary_coords);
         } else {
-            triangualte_on_face(mesh, FI(fid), mesh_points, points, it->second, point_vertex_indices, new_faces, F, bary_centers);
+            triangualte_on_face1(mesh, FI(fid), fid, mesh_points, corner_points, it->second, point_vertex_indices, new_faces, F, point_bary_coords);
         }
         face_evolutions.resize(new_faces.size(), fid.id());
     }
 
-    const auto points_3d = mesh_points | view_ts([] (const Point_2& p) { return GV3(p.x(), p.y(), 0.0); }) | std::ranges::to<std::vector>();
-    auto [gc_mesh, gc_geometry] = gs::makeManifoldSurfaceMeshAndGeometry(new_faces, points_3d);
-    const auto gc_boundary_vertices = point_vertex_indices | view_ts([&] (const VI vid) {return gc_mesh->vertex(vid.id());}) | std::ranges::to<std::vector>();
-    gs::VertexData<bool> is_boundary_vertex(*gc_mesh, false);
-    for (const auto& vid : point_vertex_indices) {
-        is_boundary_vertex[vid] = true;
+    std::vector<std::size_t> vertex_faces(mesh_points.size());
+    std::vector<double> vertex_bary_coordinates(mesh_points.size() * 3);
+    for (std::size_t i = 0; i < corner_points.size(); i++) {
+        const auto vid = point_vertex_indices[i];
+        vertex_faces[vid] = point_faces[i];
+        vertex_bary_coordinates[3 * vid] = point_bary_coords[3 * i];
+        vertex_bary_coordinates[3 * vid + 1] = point_bary_coords[3 * i + 1];
+        vertex_bary_coordinates[3 * vid + 2] = point_bary_coords[3 * i + 2];
     }
-
-    std::vector<std::vector<gs::Halfedge>> initial_paths;
-    for (std::size_t i = 0; i < point_vertex_indices.size(); i++) {
-        const auto j = (i + 1) % point_vertex_indices.size();
-        initial_paths.push_back(gs::shortestEdgePathAvoidingMarkedVertices(*gc_geometry, gc_boundary_vertices[i], gc_boundary_vertices[j], is_boundary_vertex));
-    }
-
-    gs::FlipEdgeNetwork flip_network(*gc_mesh, *gc_geometry, initial_paths, is_boundary_vertex);
-    flip_network.straightenAroundMarkedVertices = false;
-    flip_network.iterativeShorten();
-    const auto& optimized_paths = flip_network.getPathPolyline();
-
-    std::vector<gs::SurfacePoint> outline;
-    for (const auto& path: optimized_paths) {
-        outline.append_range(path | std::views::take(path.size() - 1));
-    }
-
-    for (const auto& pt : outline) {
-        const auto srf_pt = pt.inSomeFace();
-        const auto real_fid = face_evolutions[srf_pt.face.getIndex()];
-    }
-
-    std::vector<Point_3> new_vertex_positions;
-    std::vector<VI> new_boundary_indices;
-    std::unordered_map<EI, std::vector<std::size_t>> edge_split_points;
-    std::unordered_map<FI, std::vector<std::size_t>> face_split_points;
-    for (const auto& pt : large_outline) {
-        record_boundary_point(pt, gc_geometry->vertexPositions, cgal_mesh, new_vertex_positions, new_boundary_indices, edge_split_points, face_split_points);
-    }
-
-    const auto original_vertex_count = cgal_mesh.num_vertices();
-    insert_point_into_mesh(cgal_mesh, new_vertex_positions, new_boundary_indices, edge_split_points, face_split_points);
-    std::vector<HI> boundary_halfedges;
-    for (std::size_t i = 0; i < new_boundary_indices.size(); i++) {
-        const auto hid = split_face_and_return_edge(cgal_mesh, new_boundary_indices[i], new_boundary_indices[(i + 1) % new_boundary_indices.size()], original_vertex_count);
-        boundary_halfedges.emplace_back(hid);
-    }
-    PMP::triangulate_faces(cgal_mesh);
 
     write_uv1("uv_clip.obj", mesh_points, new_faces);
+
+    Mesh_2 new_mesh;
+    PMP::polygon_soup_to_polygon_mesh(mesh_points, new_faces, new_mesh);
+    std::vector<std::size_t> relief_vertices(relief_points.size());
+    add_outline(mesh_points, new_faces, new_mesh, point_vertex_indices, face_evolutions, grid_dimension, relief_points, relief_boundary_point_indices, relief_vertices, tol);
+
     const auto a = 2;
 }
 
@@ -1341,6 +1531,7 @@ auto clip_region(
     const std::vector<std::vector<std::size_t>>& faces,
     const std::size_t center_id,
     const std::vector<std::size_t>& edge_point_indices,
+    const std::size_t grid_dimension,
     const double alpha
 ) {
     std::array<double, 2> angles{{M_PI - alpha * 2.0, alpha * 2.0}};
@@ -1366,27 +1557,20 @@ auto clip_region(
         corner_points.emplace_back(corner_pt[0], corner_pt[1]);
         angle += angles[(i + min_index) % 2];
     }
+    std::rotate(corner_points.begin(), corner_points.begin() + ((4 - min_index) % 4), corner_points.end());
     // write_grid("grid.obj", corner_points);
-    add_points_into_mesh(mesh, corner_points, 1e-5);
+    const auto edge_length = std::sqrt((corner_points[1] - corner_points[0]).squared_length());
+
+    add_points_into_mesh(mesh, corner_points, grid_dimension, edge_length * 0.01 / (grid_dimension - 1));
     const auto a = 2;
-
-
-    // std::vector<Eigen::Vector2d, Eigen::aligned_allocator<Eigen::Vector2d>> directions{rb_pt - lb_pt, rt_pt - rb_pt, lt_pt - rt_pt, lb_pt - lt_pt};
-    // auto [mesh, geom] = gs::makeManifoldSurfaceMeshAndGeometry(faces, points);
-    // std::vector<gs::SurfacePoint> srf_points{gs::SurfacePoint(mesh->vertex(left_bottom_id))};
-    // for (const auto& d : directions) {
-    //     const auto face_pt = srf_points.back().inSomeFace();
-    //     geometrycentral::surface::TraceOptions ts;
-    //     ts.includePath = true;
-    //     gs::traceGeodesic(*geom, face_pt.face, face_pt.faceCoords, GV3(d[0], d[1], 0.0), ts);
-    // }
 }
 
 
 auto embed_planar_grid_boundary1(
     const std::string& input_mesh_path,
     const Eigen::Vector2d& grid_min_corner,
-    const Eigen::Vector2d& grid_max_corner
+    const Eigen::Vector2d& grid_max_corner,
+    const std::size_t grid_dimension
 ){
     // 7008, 6714
     const std::size_t center_vid_index = 6714;
@@ -1446,7 +1630,7 @@ auto embed_planar_grid_boundary1(
     const auto edge_point_indices = initial_boundary_indices | std::views::take(4) | view_ts([&](const auto vid) { return vertex_point_map[vid]; }) | std::ranges::to<std::vector>();
     const auto dir = (grid_max_corner - grid_min_corner).eval();
     const auto theta = std::atan2(dir.y(), dir.x());
-    clip_region(fs.uv, local_patch_faces, vertex_point_map[center_vid_index], edge_point_indices, theta);
+    clip_region(fs.uv, local_patch_faces, vertex_point_map[center_vid_index], edge_point_indices, grid_dimension, theta);
 
     const auto a = 2;
 }
@@ -1642,7 +1826,7 @@ int main(int argc, char** argv)
     Eigen::Vector2d min_pt(bounds->min.x(), bounds->min.y());
     Eigen::Vector2d max_pt(bounds->max.x(), bounds->max.y());
     scale_box(min_pt, max_pt, scale);
-    embed_planar_grid_boundary1(mesh_path, min_pt, max_pt);
+    embed_planar_grid_boundary1(mesh_path, min_pt, max_pt, grid_dimension);
     auto [mesh, boundary_halfedges, segment_offset] = embed_planar_grid_boundary(mesh_path, min_pt, max_pt, 8, grid_dimension);
     const auto faces = surround_faces(mesh, boundary_halfedges);
     auto [patch_points, _, patch_vertices, patch_faces] = extract_faces(mesh, faces, boundary_halfedges);
