@@ -15,6 +15,7 @@ public:
 
     VMat V;
     FMat F;
+    VMat N;
 
     VMat2 uv;
     const std::size_t n_bnd_points;

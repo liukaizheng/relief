@@ -46,9 +46,10 @@
 #include <igl/flipped_triangles.h>
 #include <igl/write_triangle_mesh.h>
 
+#include <boost/functional/hash.hpp>
+
 #include "eigen_alias.h"
 #include "flatten_surface.h"
-#include "geometrycentral/surface/barycentric_vector.h"
 #include "geometrycentral/surface/manifold_surface_mesh.h"
 #include "geometrycentral/surface/vertex_position_geometry.h"
 #include "geometrycentral/utilities/utilities.h"
@@ -61,6 +62,7 @@
 #include <optional>
 #include <ranges>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -132,8 +134,13 @@ auto write_uv1(const std::string& name, const std::vector<Point_2>& uv, const st
     for (Eigen::Index i = 0; i < uv.size(); ++i) {
         file << "v " << uv[i].x() << " " << uv[i].y() << " 0\n";
     }
-    for (Eigen::Index i = 0; i < F.size(); ++i) {
-        file << "f " << F[i][0] + 1 << " " << F[i][1] + 1 << " " << F[i][2] + 1 << "\n";
+
+    for (Eigen::Index i = 0; i < F.size(); i++) {
+        file << "f ";
+        for (Eigen::Index j = 0; j < F[i].size(); j++) {
+            file << F[i][j] + 1 << " ";
+        }
+        file << "\n";
     }
     file.close();
 }
@@ -152,6 +159,35 @@ auto write_mesh2(const std::string& name, const Mesh_2& mesh)
         file << "\n";
     }
     file.close();
+}
+
+auto write_mesh_with_colors(
+    const std::string& name,
+    const std::vector<Point_3>& points,
+    const std::vector<std::vector<std::size_t>>& faces,
+    const std::size_t face_start_index,
+    const std::size_t face_end_index
+) {
+    std::ofstream file(name);
+    file << "mtllib colors.mtl\n";
+    for (const auto& point : points) {
+        file << "v " << point.x() << " " << point.y() << " " << point.z() << "\n";
+    }
+    file << "usemtl white_mat\n";
+    for (std::size_t fid = 0; fid < faces.size(); fid++) {
+        if (fid == face_start_index) {
+            file << "usemtl red_mat\n";
+        } else if (fid == face_end_index) {
+            file << "usemtl white_mat\n";
+        }
+        file << "f ";
+        for (const auto& vid : faces[fid]) {
+            file << vid + 1 << " ";
+        }
+        file << "\n";
+    }
+    file.close();
+
 }
 
 void compute_bary_coordinates(
@@ -177,6 +213,9 @@ void compute_bary_coordinates(
         const auto b1 = (d11 * d20 - d01 * d21) / denom;
         const auto b2 = (d00 * d21 - d01 * d20) / denom;
         const auto b0 = 1.0 - b1 - b2;
+        if (b1 < -1e-8 || b2 < -1e-8 || b0 < -1e-8) {
+            const auto a = 2;
+        }
         B.row(pid) << b0, b1, b2;
     }
 }
@@ -282,6 +321,35 @@ void write_halfedges(
     }
     out.close();
 }
+void write_halfedges(
+    const std::string& name,
+    const Mesh_2& mesh,
+    const std::vector<HI>& halfedges
+) {
+    const auto closed = mesh.source(halfedges.front()) == mesh.target(halfedges.back());
+    auto out = fmt::output_file(name);
+    for (const auto& halfedge : halfedges) {
+        const auto source = mesh.source(halfedge);
+        const auto& source_point = mesh.point(source);
+        out.print("v {} {} {}\n", source_point.x(), source_point.y(), 0.0);
+    }
+    if (!closed) {
+        const auto& he = halfedges.back();
+        const auto& target_point = mesh.point(mesh.target(he));
+        out.print("v {} {} {}\n", target_point.x(), target_point.y(), 0.0);
+    }
+
+    const auto len = closed ? (halfedges.size() - 1) : halfedges.size();
+    for (std::size_t i = 0; i < len; i++) {
+        const auto j = i + 1;
+        out.print("l {} {}\n", i + 1, j + 1);
+    }
+    if (closed) {
+        out.print("l {} {}\n", halfedges.size(), 1);
+    }
+    out.close();
+}
+
 
 void write_polyline(const std::string& name, const std::vector<gs::SurfacePoint>& points, gs::VertexData<geometrycentral::Vector3>& vertexData)
 {
@@ -568,6 +636,38 @@ void triangualte_on_face(
         baray_center(face_point_indices, Eigen::placeholders::all) = B;
     }
 }
+
+void triangulate_face(
+    const std::vector<Point_2>& points,
+    const std::vector<std::size_t>& vertices,
+    std::vector<std::vector<std::size_t>>& new_faces
+) {
+
+    VMat2 V(vertices.size(), 2);
+    for (std::size_t i = 0; i < vertices.size(); ++i) {
+        const auto vid = vertices[i];
+        const auto& point = points[vid];
+        V.row(i) << point.x(), point.y();
+    }
+    EMat E(vertices.size(), 2);
+    for (std::size_t i = 0; i < vertices.size(); ++i) {
+        E.row(i) << i, (i + 1) % vertices.size();
+    }
+
+    VMat2 H;
+    VMat2 WV;
+    FMat WF;
+    igl::triangle::triangulate(V, E, H, "Q", WV, WF);
+    for (Eigen::Index i = 0; i < WF.rows(); i++) {
+        std::vector<std::size_t> face;
+        for (Eigen::Index j = 0; j < 3; j++) {
+            const auto vid = vertices[WF(i, j)];
+            face.emplace_back(vid);
+        }
+        new_faces.emplace_back(std::move(face));
+    }
+}
+
 void triangualte_on_face1(
     const Mesh_2& mesh,
     const FI fid,
@@ -742,7 +842,8 @@ auto insert_point_into_mesh(
     }
 }
 
-auto surround_faces(const Mesh& mesh, const std::vector<Mesh ::Halfedge_index>& halfedges)
+template <typename P>
+auto surround_faces(const CGAL::Surface_mesh<P>& mesh, const std::vector<Mesh ::Halfedge_index>& halfedges)
 {
     std::vector<bool> visited(mesh.number_of_faces() + mesh.number_of_removed_faces(), false);
     std::vector<Mesh::Face_index> faces;
@@ -758,7 +859,7 @@ auto surround_faces(const Mesh& mesh, const std::vector<Mesh ::Halfedge_index>& 
         const auto curr_fid = faces[i];
         for (const auto hid : mesh.halfedges_around_face(mesh.halfedge(curr_fid))) {
             const auto oppo_fid = mesh.face(mesh.opposite(hid));
-            if (!visited[oppo_fid]) {
+            if (oppo_fid.is_valid() && !visited[oppo_fid]) {
                 faces.emplace_back(oppo_fid);
                 visited[oppo_fid] = true;
             }
@@ -767,11 +868,12 @@ auto surround_faces(const Mesh& mesh, const std::vector<Mesh ::Halfedge_index>& 
     return faces;
 }
 
-auto extract_faces(const Mesh& mesh, const std::vector<FI>& faces, std::vector<HI>& boundary_halfedges)
+template <typename P>
+auto extract_faces(const CGAL::Surface_mesh<P>& mesh, const std::vector<FI>& faces, const std::vector<HI>& boundary_halfedges)
 {
     constexpr auto INVALID = std::numeric_limits<std::size_t>::max();
     std::vector<std::size_t> point_map(mesh.number_of_vertices() + mesh.number_of_removed_vertices(), INVALID);
-    std::vector<Point_3> points;
+    std::vector<P> points;
     std::vector<VI> point_vertices;
     for (const auto hid : boundary_halfedges) {
         const auto vid = mesh.source(hid);
@@ -1216,18 +1318,24 @@ void locate_points_on_face1(
 }
 
 auto add_outline(
-    const std::vector<Point_2>& points,
-    const std::vector<std::vector<std::size_t>>& faces,
-    Mesh_2& mesh,
+    std::vector<Point_2>& points,
+    std::vector<std::vector<std::size_t>>& faces,
     const std::vector<VI>& boundary_vertices,
     const std::vector<std::size_t>& face_map,
     const std::size_t grid_dimension,
     const std::vector<Point_2>& relief_points,
+    const MatXu& relief_index_mat,
     const std::vector<std::size_t>& relief_boundary_point_indices,
+    const std::vector<std::size_t>& relief_inner_point_indices,
     std::vector<std::size_t>& relief_vertex_indices,
+    std::vector<std::size_t>& vertex_faces,
+    std::vector<double>& vertex_bary_coords,
+    const FMat& F,
     const double tol
 ) {
 
+    Mesh_2 mesh;
+    PMP::polygon_soup_to_polygon_mesh(points, faces, mesh);
     const auto points_3d = points | view_ts([] (const Point_2& p) { return GV3(p.x(), p.y(), 0.0); }) | std::ranges::to<std::vector>();
     auto [gc_mesh, gc_geometry] = gs::makeManifoldSurfaceMeshAndGeometry(faces, points_3d);
     const auto gc_boundary_vertices = boundary_vertices | view_ts([&] (const VI vid) {return gc_mesh->vertex(vid.id());}) | std::ranges::to<std::vector>();
@@ -1279,10 +1387,11 @@ auto add_outline(
     }
     const auto n_old_points = mesh.num_vertices();
     split_edges(mesh, edge_split_points, new_points, point_vertices, tol);
+    std::vector<HI> outline_halfedges(outline.size());
     for (std::size_t i = 0; i < outline.size(); i++) {
         const auto va = point_vertices[i];
         const auto vb = point_vertices[(i + 1) % outline.size()];
-        split_face_and_return_edge(mesh, va, vb, n_old_points);
+        outline_halfedges[i] = split_face_and_return_edge(mesh, va, vb, n_old_points);
     }
     // write_mesh2("mesh2.obj", mesh);
     std::vector<double> boundary_edge_length(outline.size());
@@ -1295,7 +1404,12 @@ auto add_outline(
     std::vector<Point_2> mesh_points;
     mesh_points.append_range(mesh.points());
 
-    std::vector<std::vector<std::size_t>> edge_point_indices;
+    std::vector<std::vector<std::size_t>> edge_vertex_indices(outline.size());
+    const auto hash = [](const std::pair<std::size_t, std::size_t>& p) noexcept {
+        return boost::hash_value(p);
+    };
+    std::unordered_map<std::pair<std::size_t, std::size_t>, std::vector<std::size_t>, decltype(hash)> grid_edge_middle_vertices_map;
+    std::vector<std::size_t> middle_vertices;
     for (std::size_t i = 0; i < boundary_vertices.size(); i++) {
         std::vector<double> grid_edge_lengths;
         grid_edge_lengths.reserve(separators[i + 1] - separators[i] + 1);
@@ -1310,7 +1424,12 @@ auto add_outline(
         const auto end = (i + 1) * (grid_dimension - 1);
         for (std::size_t i2 = start; i2 < end; i2++) {
             const auto relief_pid = relief_boundary_point_indices[i2];
+            middle_vertices.clear();
             while(grid_edge_lengths[i1] + tol < curr_len) {
+                const auto vid = point_vertices[separators[i] + i1];
+                if (i2 != start && relief_vertex_indices[relief_boundary_point_indices[i2 - 1]] != vid.id()) {
+                    middle_vertices.push_back(vid.id());
+                }
                 i1 += 1;
             }
             if (std::abs(grid_edge_lengths[i1] - curr_len) < tol) {
@@ -1323,13 +1442,133 @@ auto add_outline(
                 mesh_points.emplace_back(pt);
                 point_vertices.push_back(VI(vid));
                 const auto edge_index = separators[i] + i1 - 1;
+                edge_vertex_indices[edge_index].emplace_back(vid);
                 point_faces.emplace_back(boundary_halfedge_faces[edge_index]);
+            }
+            if (!middle_vertices.empty()) {
+                grid_edge_middle_vertices_map.emplace(
+                    std::make_pair(relief_vertex_indices[relief_boundary_point_indices[i2 - 1]], relief_vertex_indices[relief_pid]), middle_vertices);
             }
             curr_len += stride;
         }
+
+        middle_vertices.clear();
+        const auto last_vid = relief_vertex_indices[relief_boundary_point_indices[end - 1]];
+        while(i1 + 1 < grid_edge_lengths.size()) {
+            const auto vid = point_vertices[separators[i] + i1];
+            if (vid.id() != last_vid) {
+                middle_vertices.push_back(vid.id());
+            }
+            i1++;
+        }
+        if (!middle_vertices.empty()) {
+            const std::size_t end_vid = i == 3 ? point_vertices[0].id() : point_vertices[separators[i + 1]].id();
+            grid_edge_middle_vertices_map.emplace(
+                std::make_pair(last_vid, end_vid), middle_vertices);
+        }
     }
 
-    const auto a = 2;
+    vertex_faces.resize(mesh_points.size());
+    vertex_bary_coords.resize(mesh_points.size() * 3);
+    std::unordered_map<std::size_t, std::vector<std::size_t>> face_vertices_map;
+    for (std::size_t pid = 0; pid < point_faces.size(); pid++) {
+        const auto fid = point_faces[pid];
+        const std::size_t vid = point_vertices[pid];
+        face_vertices_map[fid].push_back(vid);
+        vertex_faces[vid] = fid;
+    }
+
+    for (const auto& [fid, face_vertex_indices] : face_vertices_map) {
+        const auto& pa = mesh_points[F(fid, 0)];
+        const auto& pb = mesh_points[F(fid, 1)];
+        const auto& pc = mesh_points[F(fid, 2)];
+        compute_bary_coordinates(pa, pb, pc, mesh_points, face_vertex_indices, vertex_bary_coords);
+    }
+
+    const auto reversed_outline_halfedges = std::ranges::reverse_view{ outline_halfedges }
+        | view_ts([&](const HI hid) { return mesh.opposite(hid); })
+        | std::ranges::to<std::vector>();
+    // write_halfedges("reversed_outline.obj", mesh, reversed_outline_halfedges);
+    const auto outer_faces = surround_faces(mesh, reversed_outline_halfedges);
+    // auto [extracted_points, _1, _2, extracted_faces] = extract_faces(mesh, outer_faces, reversed_outline_halfedges);
+    // write_uv1("extracted.obj", extracted_points, extracted_faces);
+    std::unordered_map<HI, std::size_t> outline_halfedge_index_map(outline_halfedges.size());
+    for (std::size_t i = 0; i < outline_halfedges.size(); i++) {
+        outline_halfedge_index_map.emplace(mesh.opposite(outline_halfedges[i]), i);
+    }
+
+    const auto add_halfedge = [&](std::vector<std::size_t>& vertices, const HI hid) {
+        vertices.emplace_back(mesh.source(hid).id());
+        const auto it = outline_halfedge_index_map.find(hid);
+        if (it != outline_halfedge_index_map.end()) {
+            vertices.append_range(std::ranges::reverse_view{edge_vertex_indices[it->second]});
+        }
+    };
+    std::vector<std::vector<std::size_t>> result_face_veritces;
+    for (const auto fid : outer_faces) {
+        std::vector<std::size_t> vertices;
+        for (const auto hid : mesh.halfedges_around_face(mesh.halfedge(fid))) {
+            add_halfedge(vertices, hid);
+        }
+        if (vertices.size() == 3) {
+            result_face_veritces.emplace_back(std::move(vertices));
+        } else {
+            triangulate_face(mesh_points, vertices, result_face_veritces);
+        }
+    }
+    const auto relief_face_start_index = result_face_veritces.size();
+
+    for (const auto pid : relief_inner_point_indices) {
+        const auto vid = mesh_points.size();
+        mesh_points.emplace_back(relief_points[pid]);
+        relief_vertex_indices[pid] = vid;
+    }
+
+    const auto n_inner_points = grid_dimension - 1;
+    for (std::size_t j = 0; j < n_inner_points; ++j) {
+
+        for (std::size_t i = 0; i < n_inner_points; i++) {
+            std::vector<std::size_t> vertices;
+            const auto add_vertex = [&](const std::size_t v1, const std::size_t v2) {
+                const auto it = grid_edge_middle_vertices_map.find(std::make_pair(v1, v2));
+                if (it != grid_edge_middle_vertices_map.end()) {
+                    vertices.append_range(it->second);
+                }
+            };
+            const auto va = relief_vertex_indices[relief_index_mat(i, j)];
+            const auto vb = relief_vertex_indices[relief_index_mat(i + 1, j)];
+            const auto vc = relief_vertex_indices[relief_index_mat(i + 1, j + 1)];
+            const auto vd = relief_vertex_indices[relief_index_mat(i, j + 1)];
+
+            vertices.emplace_back(va);
+            if (j == 0) {
+                add_vertex(va, vb);
+            }
+            vertices.emplace_back(vb);
+            if (i + 1 == n_inner_points) {
+                add_vertex(vb, vc);
+            }
+            vertices.emplace_back(vc);
+            if (j + 1== n_inner_points) {
+                add_vertex(vc, vd);
+            }
+            vertices.emplace_back(vd);
+            if (i == 0) {
+                add_vertex(vd, va);
+            }
+            if (vertices.size() == 4) {
+                result_face_veritces.emplace_back(std::vector{vd, va, vb});
+                result_face_veritces.emplace_back(std::vector{vd, vb, vc});
+            } else {
+                triangulate_face(mesh_points, vertices, result_face_veritces);
+            }
+        }
+    }
+
+    write_uv1("outer.obj", mesh_points, result_face_veritces);
+    points.swap(mesh_points);
+    faces.swap(result_face_veritces);
+    return relief_face_start_index;
 }
 
 auto generate_grid(const std::vector<Point_2>& corner_points, const std::size_t grid_dimension) {
@@ -1349,11 +1588,17 @@ auto generate_grid(const std::vector<Point_2>& corner_points, const std::size_t 
     FMat F;
     write_uv("grid.obj", V, F);
 
+    std::vector<std::size_t> inner_point_indices;
     std::size_t count = 0;
     for (std::size_t j = 0; j < X.size(); ++j) {
         for (std::size_t i = 0; i < X.size(); ++i) {
-            I(i, j) = count++;
+            I(i, j) = count;
+            if (i != 0 && j != 0 && i != X.size() - 1 && j != X.size() - 1) {
+                inner_point_indices.push_back(count);
+            }
+            count += 1;
         }
+
     }
 
     const auto n_points = grid_dimension - 1;
@@ -1368,11 +1613,11 @@ auto generate_grid(const std::vector<Point_2>& corner_points, const std::size_t 
         points.emplace_back(V(i, 0), V(i, 1));
     }
 
-    return std::make_tuple(std::move(points), std::move(boundary_point_indices));
+    return std::make_tuple(std::move(points), std::move(I), std::move(boundary_point_indices), std::move(inner_point_indices));
 }
 
 auto add_points_into_mesh(Mesh_2& mesh, std::vector<Point_2>& corner_points, const std::size_t grid_dimension, const double tol) {
-    auto[relief_points, relief_boundary_point_indices] = generate_grid(corner_points, grid_dimension);
+    auto[relief_points, relief_index_mat, relief_boundary_point_indices, relief_inner_point_indices] = generate_grid(corner_points, grid_dimension);
     std::vector<Triangle_2> triangles;
     triangles.reserve(mesh.number_of_faces());
     for (const auto fid : mesh.faces()) {
@@ -1450,12 +1695,52 @@ auto add_points_into_mesh(Mesh_2& mesh, std::vector<Point_2>& corner_points, con
 
     write_uv1("uv_clip.obj", mesh_points, new_faces);
 
-    Mesh_2 new_mesh;
-    PMP::polygon_soup_to_polygon_mesh(mesh_points, new_faces, new_mesh);
     std::vector<std::size_t> relief_vertices(relief_points.size());
-    add_outline(mesh_points, new_faces, new_mesh, point_vertex_indices, face_evolutions, grid_dimension, relief_points, relief_boundary_point_indices, relief_vertices, tol);
+    const auto relief_face_start_index = add_outline(
+        mesh_points,
+        new_faces,
+        point_vertex_indices,
+        face_evolutions,
+        grid_dimension,
+        relief_points,
+        relief_index_mat,
+        relief_boundary_point_indices,
+        relief_inner_point_indices,
+        relief_vertices,
+        vertex_faces,
+        vertex_bary_coordinates,
+        F,
+        tol
+    );
 
-    const auto a = 2;
+    face_points_map.clear();
+    vertex_faces.resize(mesh_points.size());
+    vertex_bary_coordinates.resize(mesh_points.size() * 3);
+    for (const auto pid : relief_inner_point_indices) {
+        const auto vid = relief_vertices[pid];
+        auto res = tree.closest_point_and_primitive(mesh_points[vid]);
+        const auto fid = res.second - triangles.begin();
+        vertex_faces[vid] = fid;
+        face_points_map[fid].push_back(vid);
+    }
+
+    for (const auto& [fid, face_vertices] : face_points_map) {
+        const auto& pa = mesh_points[F(fid, 0)];
+        const auto& pb = mesh_points[F(fid, 1)];
+        const auto& pc = mesh_points[F(fid, 2)];
+        compute_bary_coordinates(pa, pb, pc, mesh_points, face_vertices, vertex_bary_coordinates);
+    }
+
+    return std::make_tuple(
+        std::move(mesh_points),
+        std::move(new_faces),
+        std::move(F),
+        std::move(vertex_faces),
+        std::move(vertex_bary_coordinates),
+        std::move(relief_index_mat),
+        std::move(relief_vertices),
+        relief_face_start_index
+    );
 }
 
 auto add_grid_into_uv_domain(Mesh_2& mesh, const std::size_t grid_dimension, const double edge_length)
@@ -1561,8 +1846,7 @@ auto clip_region(
     // write_grid("grid.obj", corner_points);
     const auto edge_length = std::sqrt((corner_points[1] - corner_points[0]).squared_length());
 
-    add_points_into_mesh(mesh, corner_points, grid_dimension, edge_length * 0.01 / (grid_dimension - 1));
-    const auto a = 2;
+    return add_points_into_mesh(mesh, corner_points, grid_dimension, edge_length * 0.01 / (grid_dimension - 1));
 }
 
 
@@ -1570,7 +1854,8 @@ auto embed_planar_grid_boundary1(
     const std::string& input_mesh_path,
     const Eigen::Vector2d& grid_min_corner,
     const Eigen::Vector2d& grid_max_corner,
-    const std::size_t grid_dimension
+    const std::size_t grid_dimension,
+    const Eigen::MatrixXd& height_mat
 ){
     // 7008, 6714
     const std::size_t center_vid_index = 6714;
@@ -1630,8 +1915,55 @@ auto embed_planar_grid_boundary1(
     const auto edge_point_indices = initial_boundary_indices | std::views::take(4) | view_ts([&](const auto vid) { return vertex_point_map[vid]; }) | std::ranges::to<std::vector>();
     const auto dir = (grid_max_corner - grid_min_corner).eval();
     const auto theta = std::atan2(dir.y(), dir.x());
-    clip_region(fs.uv, local_patch_faces, vertex_point_map[center_vid_index], edge_point_indices, grid_dimension, theta);
+    auto [new_vertices, new_faces, F, vertex_faces, vertex_bary_coordinates, relief_index_mat, relief_vertices, relief_face_start_index] = clip_region(fs.uv, local_patch_faces, vertex_point_map[center_vid_index], edge_point_indices, grid_dimension, theta);
+    const auto relief_face_end_index = new_faces.size();
 
+    const auto n_old_points = local_patch_points.size();
+    local_patch_points.resize(vertex_faces.size());
+    auto P = VMat::Map(reinterpret_cast<double*>(local_patch_points.data()), vertex_faces.size(), 3);
+    const auto B = VMat::Map(vertex_bary_coordinates.data(), vertex_faces.size(), 3);
+    for (std::size_t i = n_old_points; i < local_patch_points.size(); ++i) {
+        const auto fid = vertex_faces[i];
+        const auto pa = P.row(F(fid, 0));
+        const auto pb = P.row(F(fid, 1));
+        const auto pc = P.row(F(fid, 2));
+        P.row(i) = pa * B(i, 0) + pb * B(i, 1) + pc * B(i, 2);
+    }
+
+    for (std::size_t j = 1; j + 1 < grid_dimension; j++) {
+        for (std::size_t i = 1; i + 1 < grid_dimension; i++) {
+            const auto vid = relief_vertices[relief_index_mat(i, j)];
+            const auto fid = vertex_faces[vid];
+            P.row(vid) += height_mat(i, j) * fs.N.row(fid);
+        }
+    }
+    std::vector<bool> face_removed(cgal_mesh.number_of_removed_faces() + cgal_mesh.number_of_faces(), false);
+    for (const auto fid : patch_faces) {
+        face_removed[fid] = true;
+    }
+    std::unordered_map<VI, std::size_t> patch_vertex_map;
+    for (std::size_t i = 0; i < patch_vertices.size(); i++) {
+        patch_vertex_map.emplace(patch_vertices[i], i);
+    }
+
+    for (const auto fid : cgal_mesh.faces()) {
+        if (face_removed[fid]) {
+            continue;
+        }
+
+        std::vector<std::size_t> vertices;
+        for (const auto vid : cgal_mesh.vertices_around_face(cgal_mesh.halfedge(fid))) {
+            const auto it = patch_vertex_map.emplace(vid, local_patch_points.size());
+            vertices.push_back(it.first->second);
+            if (it.second) {
+                local_patch_points.emplace_back(cgal_mesh.point(vid));
+            }
+        }
+        new_faces.emplace_back(vertices);
+    }
+
+    write_mesh_with_colors("mesh3.obj", local_patch_points, new_faces, relief_face_start_index, relief_face_end_index);
+    // CGAL::IO::write_polygon_soup("mesh3.obj", local_patch_points, new_faces);
     const auto a = 2;
 }
 
@@ -1821,12 +2153,13 @@ int main(int argc, char** argv)
 
     const double scale = 0.02;
     auto [height_mat, index_mat] = get_height_mat(relief, bounds->min, grid_dimension, (bounds->max.x() - bounds->min.x()) / (grid_dimension - 1));
-    height_mat = (height_mat.array() - min_z) * scale;
+    height_mat = (height_mat.array() - min_z) * scale * 2;
+    height_mat = height_mat.array() - height_mat.minCoeff();
 
     Eigen::Vector2d min_pt(bounds->min.x(), bounds->min.y());
     Eigen::Vector2d max_pt(bounds->max.x(), bounds->max.y());
     scale_box(min_pt, max_pt, scale);
-    embed_planar_grid_boundary1(mesh_path, min_pt, max_pt, grid_dimension);
+    embed_planar_grid_boundary1(mesh_path, min_pt, max_pt, grid_dimension, height_mat);
     auto [mesh, boundary_halfedges, segment_offset] = embed_planar_grid_boundary(mesh_path, min_pt, max_pt, 8, grid_dimension);
     const auto faces = surround_faces(mesh, boundary_halfedges);
     auto [patch_points, _, patch_vertices, patch_faces] = extract_faces(mesh, faces, boundary_halfedges);

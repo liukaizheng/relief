@@ -529,6 +529,7 @@ FlattenSurface::FlattenSurface(VMat&& V, FMat&& F, const std::vector<std::size_t
 void FlattenSurface::slim_solve(const std::size_t n_iterations) {
     Eigen::Index n_free = this->V.rows() - n_bnd_points;
     auto [B1, B2, N, DA, IFV, G] = tri_gradients(this->V, this->F);
+    this->N = N;
     DA /= DA.sum();
 
     // Compute per-face gradient dot-products for a barycentric basis vector B and
