@@ -576,67 +576,6 @@ void add_points_on_face(
     }
 }
 
-void triangualte_on_face(
-    const Mesh_2& mesh,
-    const FI fid,
-    std::vector<Point_2>& points,
-    const std::vector<Point_2>& face_points,
-    const std::vector<std::size_t>& face_point_indices,
-    std::vector<VI>& point_vertex_indices,
-    std::vector<std::vector<std::size_t>>& new_faces,
-    const FMat& F,
-    VMat& baray_center)
-{
-    std::vector<std::size_t> vertices;
-    for (const auto vid : mesh.vertices_around_face(mesh.halfedge(fid))) {
-        vertices.emplace_back(vid.id());
-    }
-    const auto n_old_vertices = vertices.size();
-    for (const auto pid : face_point_indices) {
-        const auto vid = points.size();
-        points.emplace_back(face_points[pid]);
-        point_vertex_indices[pid] = VI(vid);
-        vertices.emplace_back(vid);
-    }
-
-    VMat2 V(vertices.size(), 2);
-    for (std::size_t i = 0; i < vertices.size(); ++i) {
-        const auto vid = vertices[i];
-        const auto& point = points[vid];
-        V.row(i) << point.x(), point.y();
-    }
-
-    EMat E(n_old_vertices, 2);
-    for (std::size_t i = 0; i < n_old_vertices; ++i) {
-        E.row(i) << i, (i + 1) % n_old_vertices;
-    }
-
-    VMat2 H;
-    VMat2 WV;
-    FMat WF;
-    igl::triangle::triangulate(V, E, H, "Q", WV, WF);
-    for (Eigen::Index i = 0; i < WF.rows(); i++) {
-        std::vector<std::size_t> face;
-        for (Eigen::Index j = 0; j < 3; j++) {
-            const auto vid = vertices[WF(i, j)];
-            face.emplace_back(vid);
-        }
-        new_faces.emplace_back(std::move(face));
-    }
-
-    if (!face_point_indices.empty()) {
-        const auto fv = F.row(fid.id());
-        Eigen::RowVector2d p1(points[fv[0]].x(), points[fv[0]].y());
-        Eigen::RowVector2d p2(points[fv[1]].x(), points[fv[1]].y());
-        Eigen::RowVector2d p3(points[fv[2]].x(), points[fv[2]].y());
-
-        auto I = IVec::LinSpaced(face_point_indices.size(), n_old_vertices, vertices.size() - 1).eval();
-        Eigen::MatrixXd B;
-        igl::barycentric_coordinates(V(I, Eigen::placeholders::all), p1.replicate(I.size(), 1), p2.replicate(I.size(), 1), p3.replicate(I.size(), 1), B);
-        baray_center(face_point_indices, Eigen::placeholders::all) = B;
-    }
-}
-
 void triangulate_face(
     const std::vector<Point_2>& points,
     const std::vector<std::size_t>& vertices,
@@ -668,7 +607,7 @@ void triangulate_face(
     }
 }
 
-void triangualte_on_face1(
+void triangualte_on_face(
     const Mesh_2& mesh,
     const FI fid,
     const std::size_t real_fid,
@@ -915,7 +854,7 @@ auto mesh_to_eigen_mat(const std::vector<Point_3>& points, std::vector<std::vect
     return std::make_pair(std::move(V), std::move(F));
 }
 
-auto trace_bounding_box_outline1(
+auto trace_bounding_box_outline(
     const std::string& input_mesh_path,
     Eigen::Vector2d bounding_min,
     Eigen::Vector2d bounding_max,
@@ -969,63 +908,8 @@ auto trace_bounding_box_outline1(
         record_boundary_point(trace_result.endPoint, geom->vertexPositions, mesh, outline_points, outline_vertex_indices, outline_edge_points_map, outline_face_points_map);
     }
     insert_point_into_mesh(mesh, outline_points, outline_vertex_indices, outline_edge_points_map, outline_face_points_map);
-    // CGAL::IO::write_polygon_mesh("mesh1.obj", mesh);
+    CGAL::IO::write_polygon_mesh("mesh1.obj", mesh);
     return std::make_tuple(std::move(mesh), std::move(outline_vertex_indices));
-}
-
-auto trace_bounding_box_outline(const std::string& mesh_path, Eigen::Vector2d bounding_min, Eigen::Vector2d bounding_max, const std::size_t samples_per_edge)
-{
-    auto [gmesh, geometry] = gs::readManifoldSurfaceMesh(mesh_path);
-    fmt::println(
-        "Loaded mesh '{}'\n- Vertices: {}\n- Faces: {}\n",
-        mesh_path, gmesh->nVertices(), gmesh->nFaces());
-
-    std::vector<Point_3> points;
-    std::vector<std::vector<std::size_t>> faces;
-    for (const auto& vid : gmesh->vertices()) {
-        const auto& pt = geometry->vertexPositions[vid];
-        points.emplace_back(pt.x, pt.y, pt.z);
-    }
-    for (const auto& fid : gmesh->faces()) {
-        std::vector<std::size_t> face;
-        for (const auto vid : fid.adjacentVertices()) {
-            face.emplace_back(vid.getIndex());
-        }
-        faces.emplace_back(face);
-    }
-    Mesh mesh;
-    PMP::polygon_soup_to_polygon_mesh(points, faces, mesh);
-    const auto sample_stride = 1.0 / samples_per_edge;
-
-    // gs::SurfacePoint geodesic_seed_vertex(gmesh->vertex(7008));
-    gs::SurfacePoint geodesic_seed_vertex(gmesh->vertex(6714));
-
-    const auto bounding_box_center = ((bounding_min + bounding_max) * 0.5).eval();
-    std::vector<Eigen::Vector2d, Eigen::aligned_allocator<Eigen::Vector2d>> bounding_box_corners { bounding_min, { bounding_max.x(), bounding_min.y() }, bounding_max, { bounding_min.x(), bounding_max.y() } };
-
-    std::vector<Point_3> outline_points;
-    std::vector<VI> outline_vertex_indices;
-    outline_points.reserve(samples_per_edge * 4);
-    outline_vertex_indices.reserve(samples_per_edge * 4);
-    std::unordered_map<EI, std::vector<std::size_t>> outline_edge_points_map;
-    std::unordered_map<FI, std::vector<std::size_t>> outline_face_points_map;
-
-    for (std::size_t edge_idx = 0; edge_idx < bounding_box_corners.size(); edge_idx++) {
-        const auto& edge_start = bounding_box_corners[edge_idx];
-        const auto& edge_end = bounding_box_corners[(edge_idx + 1) % bounding_box_corners.size()];
-        for (std::size_t sample_idx = 0; sample_idx < samples_per_edge; sample_idx++) {
-            const auto t = sample_idx * sample_stride;
-            const auto sampled_point_2d = (1.0 - t) * edge_start + t * edge_end;
-            const auto offset_from_center = sampled_point_2d - bounding_box_center;
-            const auto trace_result = gs::traceGeodesic(*geometry, geodesic_seed_vertex, geometrycentral::Vector2 { offset_from_center[0], offset_from_center[1] }, { .includePath = true });
-            // write_polyline(fmt::format("path_{}_{}.obj", edge_idx, sample_idx), trace_result.pathPoints, geometry->vertexPositions);
-            record_boundary_point(trace_result.endPoint, geometry->vertexPositions, mesh, outline_points, outline_vertex_indices, outline_edge_points_map, outline_face_points_map);
-        }
-    }
-
-    insert_point_into_mesh(mesh, outline_points, outline_vertex_indices, outline_edge_points_map, outline_face_points_map);
-    // CGAL::IO::write_polygon_mesh("mesh1.obj", mesh);
-    return std::make_pair(std::move(outline_vertex_indices), std::move(mesh));
 }
 
 template<typename P>
@@ -1080,77 +964,6 @@ auto split_face_and_return_edge(
         }
         return split_halfedge;
     }
-}
-
-auto embed_planar_grid_boundary(const std::string& input_mesh_path, const Eigen::Vector2d& grid_min_corner, const Eigen::Vector2d& grid_max_corner, std::size_t boundary_samples_per_edge, std::size_t grid_cells_per_axis)
-{
-    auto [initial_boundary_indices, cgal_mesh] = trace_bounding_box_outline(input_mesh_path, grid_min_corner, grid_max_corner, boundary_samples_per_edge);
-    const auto vertex_positions = cgal_mesh.points() | view_ts([](const auto& p) { return GV3 { p.x(), p.y(), p.z() }; }) | std::ranges::to<std::vector>();
-    const auto mesh_faces = cgal_mesh.faces() | view_ts([&](const auto fid) { return cgal_mesh.vertices_around_face(cgal_mesh.halfedge(fid)) | view_ts([](const auto vid) { return (std::size_t)vid.idx(); }) | std::ranges::to<std::vector>(); }) | std::ranges::to<std::vector>();
-    auto [gc_mesh, gc_geometry] = gs::makeManifoldSurfaceMeshAndGeometry(mesh_faces, vertex_positions);
-    const auto boundary_vertices_gc = initial_boundary_indices | view_ts([&gc_mesh](const auto vid) { return gc_mesh->vertex(vid.idx()); }) | std::ranges::to<std::vector>();
-
-    gs::VertexData<bool> is_boundary_vertex(*gc_mesh, false);
-    for (const auto& vid : boundary_vertices_gc) {
-        is_boundary_vertex[vid] = true;
-    }
-
-    std::vector<std::vector<gs::Halfedge>> initial_paths;
-    for (std::size_t i = 0; i < boundary_vertices_gc.size(); i++) {
-        const auto j = (i + 1) % boundary_vertices_gc.size();
-        initial_paths.push_back(gs::shortestEdgePathAvoidingMarkedVertices(*gc_geometry, boundary_vertices_gc[i], boundary_vertices_gc[j], is_boundary_vertex));
-    }
-
-    gs::FlipEdgeNetwork flip_network(*gc_mesh, *gc_geometry, initial_paths, is_boundary_vertex);
-    flip_network.straightenAroundMarkedVertices = false;
-    flip_network.iterativeShorten();
-    const auto& optimized_paths = flip_network.getPathPolyline();
-    std::vector<std::size_t> corner_path_indices { 0, boundary_samples_per_edge, boundary_samples_per_edge * 2, boundary_samples_per_edge * 3, boundary_samples_per_edge * 4 };
-    std::vector<std::vector<gs::SurfacePoint>> boundary_segments;
-    for (std::size_t i = 0; i + 1 < corner_path_indices.size(); i++) {
-        const auto start = corner_path_indices[i];
-        const auto end = corner_path_indices[i + 1];
-        std::vector<gs::SurfacePoint> segment;
-        for (std::size_t j = start; j < end; j++) {
-            const auto& path = optimized_paths[j];
-            segment.append_range(path | std::views::take(path.size() - 1));
-        }
-        boundary_segments.push_back(segment);
-    }
-
-    // for (std::size_t i = 0; i < boundary_segments.size(); i++) {
-    //     auto temp = boundary_segments[i];
-    //     const auto j = (i + 1) % boundary_segments.size();
-    //     temp.emplace_back(boundary_segments[j].front());
-    //     write_polyline(fmt::format("outline_{}.obj", i), temp, gc_geometry->vertexPositions);
-    // }
-    // CGAL::IO::write_polygon_mesh("mesh2.obj", cgal_mesh);
-
-    std::vector<Point_3> new_vertex_positions;
-    std::vector<VI> new_boundary_indices;
-    std::unordered_map<EI, std::vector<std::size_t>> edge_split_points;
-    std::unordered_map<FI, std::vector<std::size_t>> face_split_points;
-    std::vector<std::size_t> segment_offsets { 0 };
-    for (const auto& segment : boundary_segments) {
-        for (const auto& pt : segment) {
-            record_boundary_point(pt, gc_geometry->vertexPositions, cgal_mesh, new_vertex_positions, new_boundary_indices, edge_split_points, face_split_points);
-        }
-        segment_offsets.emplace_back(segment_offsets.back() + segment.size());
-    }
-
-    const auto original_vertex_count = cgal_mesh.num_vertices();
-    insert_point_into_mesh(cgal_mesh, new_vertex_positions, new_boundary_indices, edge_split_points, face_split_points);
-    std::vector<HI> boundary_halfedges;
-    for (std::size_t i = 0; i < new_boundary_indices.size(); i++) {
-        const auto hid = split_face_and_return_edge(cgal_mesh, new_boundary_indices[i], new_boundary_indices[(i + 1) % new_boundary_indices.size()], original_vertex_count);
-        boundary_halfedges.emplace_back(hid);
-    }
-    PMP::triangulate_faces(cgal_mesh);
-
-    // const double grid_stride = 1.0 / grid_cells_per_axis;
-    // const auto grid_sample_t_arr = std::ranges::iota_view{0ull, grid_cells_per_axis} | view_ts([grid_stride] (const auto i)  { return grid_stride * i; }) | std::ranges::to<std::vector>();
-
-    return make_tuple(std::move(cgal_mesh), std::move(boundary_halfedges), std::move(segment_offsets));
 }
 
 auto generate_grid_points(const std::size_t grid_dimension, const double edge_length)
@@ -1676,9 +1489,9 @@ auto add_points_into_mesh(Mesh_2& mesh, std::vector<Point_2>& corner_points, con
     for (const auto fid : mesh.faces()) {
         const auto it = face_points_map.find(fid);
         if (it == face_points_map.end()) {
-            triangualte_on_face1(mesh, FI(fid), fid, mesh_points, corner_points, {}, point_vertex_indices, new_faces, F, point_bary_coords);
+            triangualte_on_face(mesh, FI(fid), fid, mesh_points, corner_points, {}, point_vertex_indices, new_faces, F, point_bary_coords);
         } else {
-            triangualte_on_face1(mesh, FI(fid), fid, mesh_points, corner_points, it->second, point_vertex_indices, new_faces, F, point_bary_coords);
+            triangualte_on_face(mesh, FI(fid), fid, mesh_points, corner_points, it->second, point_vertex_indices, new_faces, F, point_bary_coords);
         }
         face_evolutions.resize(new_faces.size(), fid.id());
     }
@@ -1743,74 +1556,6 @@ auto add_points_into_mesh(Mesh_2& mesh, std::vector<Point_2>& corner_points, con
     );
 }
 
-auto add_grid_into_uv_domain(Mesh_2& mesh, const std::size_t grid_dimension, const double edge_length)
-{
-    std::vector<Triangle_2> triangles;
-    triangles.reserve(mesh.number_of_faces());
-    for (const auto fid : mesh.faces()) {
-        const auto h1 = mesh.halfedge(fid);
-        const auto h2 = mesh.next(h1);
-        const auto h3 = mesh.next(h2);
-        triangles.emplace_back(
-            mesh.point(mesh.target(h1)),
-            mesh.point(mesh.target(h2)),
-            mesh.point(mesh.target(h3)));
-    }
-
-    Tree tree(triangles.begin(), triangles.end());
-    tree.accelerate_distance_queries();
-    auto points = generate_grid_points(grid_dimension, edge_length);
-    std::unordered_map<std::size_t, std::vector<std::size_t>> face_points_map(mesh.num_faces());
-    face_points_map.reserve(mesh.num_faces());
-    IVec point_faces(points.size());
-    for (std::size_t i = 0; i < points.size(); ++i) {
-        auto res = tree.closest_point_and_primitive(points[i]);
-        const auto fid = res.second - triangles.begin();
-        point_faces[i] = fid;
-        face_points_map[fid].push_back(i);
-    }
-
-    VMat bary_centers = VMat::Zero(points.size(), 3);
-    std::vector<VI> point_vertex_indices(points.size());
-    std::unordered_map<EI, std::vector<std::size_t>> edge_points_map;
-    const double tol = edge_length / (grid_dimension - 1) * 0.001;
-    for (auto& [fid, face_point_indices] : face_points_map) {
-        locate_points_on_face(mesh, points, FI(fid), face_point_indices, edge_points_map, point_vertex_indices, bary_centers, tol * tol);
-    }
-    const std::size_t n_old_vertices = mesh.number_of_vertices();
-    FMat F(mesh.number_of_faces(), 3);
-    for (const auto fid : mesh.faces()) {
-        const auto h1 = mesh.halfedge(fid);
-        const auto h2 = mesh.next(h1);
-        const auto h3 = mesh.next(h2);
-
-        F.row(fid.id()) << mesh.source(h1).id(), mesh.source(h2).id(), mesh.source(h3).id();
-    }
-
-    split_edges(mesh, edge_points_map, points, point_vertex_indices, tol);
-    std::vector<std::vector<std::size_t>> new_faces;
-    std::vector<Point_2> mesh_points;
-    mesh_points.append_range(mesh.points());
-    for (const auto fid : mesh.faces()) {
-        const auto it = face_points_map.find(fid);
-        if (it == face_points_map.end()) {
-            triangualte_on_face(mesh, FI(fid), mesh_points, points, {}, point_vertex_indices, new_faces, F, bary_centers);
-        } else {
-            triangualte_on_face(mesh, FI(fid), mesh_points, points, it->second, point_vertex_indices, new_faces, F, bary_centers);
-        }
-    }
-
-    const auto error = (bary_centers.rowwise().sum().array() - 1.00).abs().maxCoeff();
-    if (error > 1e-3) {
-        fmt::println(stderr, "Barycenter error: {}", error);
-    }
-
-    return std::make_tuple(std::move(mesh_points), std::move(new_faces), std::move(point_faces), std::move(point_vertex_indices), std::move(F), std::move(bary_centers));
-
-    // Mesh_2 new_mesh;
-    // PMP::polygon_soup_to_polygon_mesh(mesh_points, new_faces, new_mesh);
-}
-
 auto clip_region(
     const VMat2& V,
     const std::vector<std::vector<std::size_t>>& faces,
@@ -1843,7 +1588,7 @@ auto clip_region(
         angle += angles[(i + min_index) % 2];
     }
     std::rotate(corner_points.begin(), corner_points.begin() + ((4 - min_index) % 4), corner_points.end());
-    // write_grid("grid.obj", corner_points);
+    write_grid("grid.obj", corner_points);
     const auto edge_length = std::sqrt((corner_points[1] - corner_points[0]).squared_length());
 
     return add_points_into_mesh(mesh, corner_points, grid_dimension, edge_length * 0.01 / (grid_dimension - 1));
@@ -1857,9 +1602,9 @@ auto embed_planar_grid_boundary1(
     const std::size_t grid_dimension,
     const Eigen::MatrixXd& height_mat
 ){
-    // 7008, 6714
-    const std::size_t center_vid_index = 6714;
-    auto [cgal_mesh, initial_boundary_indices] = trace_bounding_box_outline1(input_mesh_path, grid_min_corner, grid_max_corner, center_vid_index);
+    // back: 7008, tail: 6714,
+    const std::size_t center_vid_index = 2347;
+    auto [cgal_mesh, initial_boundary_indices] = trace_bounding_box_outline(input_mesh_path, grid_min_corner, grid_max_corner, center_vid_index);
     const auto vertex_positions = cgal_mesh.points() | view_ts([](const auto& p) { return GV3 { p.x(), p.y(), p.z() }; }) | std::ranges::to<std::vector>();
     const auto mesh_faces = cgal_mesh.faces() | view_ts([&](const auto fid) { return cgal_mesh.vertices_around_face(cgal_mesh.halfedge(fid)) | view_ts([](const auto vid) { return (std::size_t)vid.idx(); }) | std::ranges::to<std::vector>(); }) | std::ranges::to<std::vector>();
     auto [gc_mesh, gc_geometry] = gs::makeManifoldSurfaceMeshAndGeometry(mesh_faces, vertex_positions);
@@ -1870,22 +1615,17 @@ auto embed_planar_grid_boundary1(
         is_boundary_vertex[vid] = true;
     }
 
-    std::vector<std::vector<gs::Halfedge>> initial_paths;
+    std::vector<gs::SurfacePoint> large_outline;
     for (std::size_t i = 0; i < boundary_vertices_gc.size(); i++) {
         const auto j = (i + 1) % boundary_vertices_gc.size();
-        initial_paths.push_back(gs::shortestEdgePathAvoidingMarkedVertices(*gc_geometry, boundary_vertices_gc[i], boundary_vertices_gc[j], is_boundary_vertex));
-    }
-
-    gs::FlipEdgeNetwork flip_network(*gc_mesh, *gc_geometry, initial_paths, is_boundary_vertex);
-    flip_network.straightenAroundMarkedVertices = false;
-    flip_network.iterativeShorten();
-    const auto& optimized_paths = flip_network.getPathPolyline();
-
-    std::vector<gs::SurfacePoint> large_outline;
-    for (const auto& path: optimized_paths) {
+        auto initial_path = gs::shortestEdgePathAvoidingMarkedVertices(*gc_geometry, boundary_vertices_gc[i], boundary_vertices_gc[j], is_boundary_vertex);
+        gs::FlipEdgeNetwork flip_network(*gc_mesh, *gc_geometry, {initial_path}, is_boundary_vertex);
+        flip_network.straightenAroundMarkedVertices = false;
+        flip_network.iterativeShorten();
+        const auto paths = flip_network.getPathPolyline();
+        const auto& path = paths[0];
         large_outline.append_range(path | std::views::take(path.size() - 1));
     }
-
     std::vector<Point_3> new_vertex_positions;
     std::vector<VI> new_boundary_indices;
     std::unordered_map<EI, std::vector<std::size_t>> edge_split_points;
@@ -1905,7 +1645,7 @@ auto embed_planar_grid_boundary1(
 
     const auto patch_faces = surround_faces(cgal_mesh, boundary_halfedges);
     auto [local_patch_points, vertex_point_map, patch_vertices, local_patch_faces] = extract_faces(cgal_mesh, patch_faces, boundary_halfedges);
-    // CGAL::IO::write_polygon_soup("mesh2.obj", local_patch_points, local_patch_faces);
+    CGAL::IO::write_polygon_soup("mesh2.obj", local_patch_points, local_patch_faces);
     auto eigen_data = mesh_to_eigen_mat(local_patch_points, local_patch_faces);
     FlattenSurface fs(std::move(eigen_data.first), std::move(eigen_data.second), boundary_halfedges.size());
     fs.slim_solve(20);
@@ -2151,66 +1891,22 @@ int main(int argc, char** argv)
     const std::size_t grid_dimension = static_cast<std::size_t>(std::sqrt(relief.number_of_vertices()));
     fmt::print("Estimated grid dimension: {}\n", grid_dimension);
 
-    const double scale = 0.02;
+    const double scale = 0.0095;
     auto [height_mat, index_mat] = get_height_mat(relief, bounds->min, grid_dimension, (bounds->max.x() - bounds->min.x()) / (grid_dimension - 1));
-    height_mat = (height_mat.array() - min_z) * scale * 2;
+    height_mat = (height_mat.array() - min_z) * scale;
     height_mat = height_mat.array() - height_mat.minCoeff();
 
     Eigen::Vector2d min_pt(bounds->min.x(), bounds->min.y());
     Eigen::Vector2d max_pt(bounds->max.x(), bounds->max.y());
     scale_box(min_pt, max_pt, scale);
     embed_planar_grid_boundary1(mesh_path, min_pt, max_pt, grid_dimension, height_mat);
-    auto [mesh, boundary_halfedges, segment_offset] = embed_planar_grid_boundary(mesh_path, min_pt, max_pt, 8, grid_dimension);
-    const auto faces = surround_faces(mesh, boundary_halfedges);
-    auto [patch_points, _, patch_vertices, patch_faces] = extract_faces(mesh, faces, boundary_halfedges);
-
-    auto fv_mat = mesh_to_eigen_mat(patch_points, patch_faces);
-
-    auto V1 = fv_mat.first;
-    auto F1 = fv_mat.second;
-
-    FlattenSurface flatten_surface(std::move(fv_mat.first), std::move(fv_mat.second), segment_offset);
-    flatten_surface.slim_solve(10);
-    // DeformSurface deform_surface(std::move(V1), std::move(F1), segment_offset.back());
-    // auto new_vertices = V1;
-    // new_vertices.leftCols(2) = flatten_surface.uv;
-    // new_vertices.rightCols(1).setZero();
-    // new_vertices.col(2).tail(new_vertices.rows() - segment_offset.back()).setRandom();
-    // deform_surface.deform(10, new_vertices);
-
-    VMat N;
-    igl::per_face_normals(flatten_surface.V, flatten_surface.F, N);
-
-    std::vector<Point_2> uv_points;
-    uv_points.reserve(flatten_surface.uv.rows());
-    for (std::size_t i = 0; i < flatten_surface.uv.rows(); ++i) {
-        uv_points.emplace_back(flatten_surface.uv(i, 0), flatten_surface.uv(i, 1));
-    }
-    Mesh_2 uv_mesh;
-    PMP::polygon_soup_to_polygon_mesh(uv_points, patch_faces, uv_mesh);
-
-    auto [
-        relief_base_uvs, relief_base_faces, point_faces, grid_point_vertex_indices, path_face_vertices, bary_centers
-    ] = add_grid_into_uv_domain(uv_mesh, grid_dimension, flatten_surface.mean_edge_length);
-    auto relief_base_points = build_relief_base(patch_points, relief_base_uvs.size(), point_faces, path_face_vertices, bary_centers, grid_point_vertex_indices);
-    // CGAL::IO::write_polygon_soup("mesh2.obj", relief_base_points, relief_base_faces);
-
-    Mesh base_relief_mesh;
-    PMP::polygon_soup_to_polygon_mesh(relief_base_points, relief_base_faces, base_relief_mesh);
-
-    build_relief_top(relief, relief_base_points, point_faces, height_mat, index_mat, N, grid_point_vertex_indices);
-    CGAL::IO::write_polygon_mesh("mesh3.obj", relief);
-
-    get_base_boundary(base_relief_mesh, grid_dimension, grid_point_vertex_indices);
-    const auto base_outline = get_top_boundary(grid_dimension, index_mat);
-
     return 0;
 }
 
  int main1(int argc, char** argv) {
      VMat V;
      FMat F;
-     igl::read_triangle_mesh("face.obj", V, F);
+     igl::read_triangle_mesh("cylinder_cut.obj", V, F);
      Eigen::MatrixXi F1 = F.cast<int>();
      Eigen::VectorXi bnd;
 
@@ -2232,7 +1928,7 @@ int main(int argc, char** argv)
      F.col(1) = map(F.col(1)).cast<std::size_t>();
      F.col(2) = map(F.col(2)).cast<std::size_t>();
 
-     igl::write_triangle_mesh("mesh2.obj", V, F.cast<int>());
+     // igl::write_triangle_mesh("mesh2.obj", V, F.cast<int>());
 
      bnd = Eigen::VectorXi::LinSpaced(bnd.size(), 0, bnd.size() - 1);
      Eigen::MatrixXd bnd_uv, uv;
@@ -2241,6 +1937,8 @@ int main(int argc, char** argv)
      if (igl::flipped_triangles(uv,F).size() != 0) {
        igl::harmonic(F,bnd,bnd_uv,1,uv); // use uniform laplacian
      }
+
+     write_uv("init.obj", uv, F);
 
      VMat newV = V;
      newV.setZero();
