@@ -213,9 +213,6 @@ void compute_bary_coordinates(
         const auto b1 = (d11 * d20 - d01 * d21) / denom;
         const auto b2 = (d00 * d21 - d01 * d20) / denom;
         const auto b0 = 1.0 - b1 - b2;
-        if (b1 < -1e-8 || b2 < -1e-8 || b0 < -1e-8) {
-            const auto a = 2;
-        }
         B.row(pid) << b0, b1, b2;
     }
 }
@@ -896,7 +893,14 @@ auto trace_bounding_box_outline(
     bounding_box_corners.emplace_back(bounding_max);
     bounding_box_corners.emplace_back(bounding_box_center.x(), bounding_max.y());
     bounding_box_corners.emplace_back(bounding_min.x(), bounding_max.y());
-
+    const auto angle = 290.0 / 180.0 * M_PI;
+    Eigen::Matrix2d rot;
+    rot << std::cos(angle), -std::sin(angle),
+          std::sin(angle), std::cos(angle);
+    for (auto& corner : bounding_box_corners) {
+        const auto vec = (corner - bounding_box_center).eval();
+        corner = bounding_box_center + rot * vec;
+    }
 
     std::unordered_map<EI, std::vector<std::size_t>> outline_edge_points_map;
     std::unordered_map<FI, std::vector<std::size_t>> outline_face_points_map;
@@ -1603,7 +1607,7 @@ auto embed_planar_grid_boundary1(
     const Eigen::MatrixXd& height_mat
 ){
     // back: 7008, tail: 6714,
-    const std::size_t center_vid_index = 2347;
+    const std::size_t center_vid_index = 6048;
     auto [cgal_mesh, initial_boundary_indices] = trace_bounding_box_outline(input_mesh_path, grid_min_corner, grid_max_corner, center_vid_index);
     const auto vertex_positions = cgal_mesh.points() | view_ts([](const auto& p) { return GV3 { p.x(), p.y(), p.z() }; }) | std::ranges::to<std::vector>();
     const auto mesh_faces = cgal_mesh.faces() | view_ts([&](const auto fid) { return cgal_mesh.vertices_around_face(cgal_mesh.halfedge(fid)) | view_ts([](const auto vid) { return (std::size_t)vid.idx(); }) | std::ranges::to<std::vector>(); }) | std::ranges::to<std::vector>();
@@ -1842,7 +1846,7 @@ auto get_top_boundary(const std::size_t grid_dimensioin, const MatXu& index_mat)
 
 } // namespace
 
-int main(int argc, char** argv)
+int main1(int argc, char** argv)
 {
     CLI::App app { "Relief App" };
     std::string mesh_path;
@@ -1903,52 +1907,53 @@ int main(int argc, char** argv)
     return 0;
 }
 
- int main1(int argc, char** argv) {
-     VMat V;
-     FMat F;
-     igl::read_triangle_mesh("cylinder_cut.obj", V, F);
-     Eigen::MatrixXi F1 = F.cast<int>();
-     Eigen::VectorXi bnd;
+void long_time_slim() {
+    VMat V;
+    FMat F;
+    igl::read_triangle_mesh("face.obj", V, F);
+    Eigen::MatrixXi F1 = F.cast<int>();
+    Eigen::VectorXi bnd;
 
-     igl::boundary_loop(F1, bnd);
-     Eigen::VectorXi map(V.rows());
-     const auto INVALID = V.rows();
-     map.setConstant(INVALID);
+    igl::boundary_loop(F1, bnd);
+    Eigen::VectorXi map(V.rows());
+    const auto INVALID = V.rows();
+    map.setConstant(INVALID);
 
-     map(bnd) = Eigen::VectorXi::LinSpaced(bnd.size(), 0, bnd.size() - 1);
-     Eigen::Index count = bnd.size();
-     for (Eigen::Index i = 0; i < V.rows(); ++i) {
-         if (map(i) == INVALID) {
-             map[i] = count++;
-         }
-     }
-     VMat V1 = V;
-     V(map, Eigen::placeholders::all) = V1;
-     F.col(0) = map(F.col(0)).cast<std::size_t>();
-     F.col(1) = map(F.col(1)).cast<std::size_t>();
-     F.col(2) = map(F.col(2)).cast<std::size_t>();
+    map(bnd) = Eigen::VectorXi::LinSpaced(bnd.size(), 0, bnd.size() - 1);
+    Eigen::Index count = bnd.size();
+    for (Eigen::Index i = 0; i < V.rows(); ++i) {
+        if (map(i) == INVALID) {
+            map[i] = count++;
+        }
+    }
+    VMat V1 = V;
+    V(map, Eigen::placeholders::all) = V1;
+    F.col(0) = map(F.col(0)).cast<std::size_t>();
+    F.col(1) = map(F.col(1)).cast<std::size_t>();
+    F.col(2) = map(F.col(2)).cast<std::size_t>();
 
-     // igl::write_triangle_mesh("mesh2.obj", V, F.cast<int>());
+    igl::write_triangle_mesh("mesh2.obj", V, F.cast<int>());
 
-     bnd = Eigen::VectorXi::LinSpaced(bnd.size(), 0, bnd.size() - 1);
-     Eigen::MatrixXd bnd_uv, uv;
-     igl::map_vertices_to_circle(V, bnd, bnd_uv);
-     igl::harmonic(V,F,bnd,bnd_uv,1,uv);
-     if (igl::flipped_triangles(uv,F).size() != 0) {
-       igl::harmonic(F,bnd,bnd_uv,1,uv); // use uniform laplacian
-     }
+    bnd = Eigen::VectorXi::LinSpaced(bnd.size(), 0, bnd.size() - 1);
+    Eigen::MatrixXd bnd_uv, uv;
+    igl::map_vertices_to_circle(V, bnd, bnd_uv);
+    igl::harmonic(V,F,bnd,bnd_uv,1,uv);
+    if (igl::flipped_triangles(uv,F).size() != 0) {
+        igl::harmonic(F,bnd,bnd_uv,1,uv); // use uniform laplacian
+    }
 
-     write_uv("init.obj", uv, F);
+    VMat newV = V;
+    newV.setZero();
+    newV.leftCols(2) = uv;
 
-     VMat newV = V;
-     newV.setZero();
-     newV.leftCols(2) = uv;
+    // DeformSurface ds(std::move(V), std::move(F), bnd.size());
+    // ds.deform(10, newV);
+    VMat2 uv1 = uv;
+    FlattenSurface fs(std::move(V), std::move(F), uv1, 0);
+    fs.slim_solve(10);
+}
 
-     // DeformSurface ds(std::move(V), std::move(F), bnd.size());
-     // ds.deform(10, newV);
-     VMat2 uv1 = uv;
-     FlattenSurface fs(std::move(V), std::move(F), uv1, 0);
-     fs.slim_solve(10);
-
-     return 0;
- }
+int main(int argc, char** argv) {
+    long_time_slim();
+    return 0;
+}

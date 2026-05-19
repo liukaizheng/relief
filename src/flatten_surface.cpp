@@ -623,6 +623,7 @@ void FlattenSurface::slim_solve(const std::size_t n_iterations) {
         if (L.size() == 0) {
             L = normal_cache.build(At);
         }
+        RowSpMat L_temp = At * A;
         normal_cache.assign(At, DDA, L);
         multiply_normal_rhs(At, DDA, rhs, real_rhs);
 
