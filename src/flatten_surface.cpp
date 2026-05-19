@@ -1,4 +1,5 @@
 #include "flatten_surface.h"
+#include "eigen_alias.h"
 #include <igl/harmonic.h>
 #include <igl/polar_svd.h>
 #include <fmt/format.h>
@@ -59,7 +60,7 @@ auto tri_gradients(const Eigen::MatrixBase<DerivedV>& vertices, const Eigen::Mat
     cross(normals, edge_ca, grad_phi1);
     grad_phi1 = grad_phi1.array() / area_repeated;
 
-    Eigen::SparseMatrix<Eigen::Index> face_vertex_map(face_count, vertex_count); // maps face->vertex slot
+    Eigen::SparseMatrix<Eigen::Index, Eigen::RowMajor> face_vertex_map(face_count, vertex_count);
     std::vector<Eigen::Triplet<Eigen::Index>> fv_entries; // buffer for map entries
     Eigen::Index entry = 0; // running triplet id
     for (Eigen::Index i = 0; i < face_count; i++) {
@@ -536,14 +537,12 @@ void FlattenSurface::slim_solve(const std::size_t n_iterations) {
     // write the scalar results into a dense buffer matching the IFV/G ordering.
     auto assemble_gradient_values = [&](const auto& B, double* values) noexcept {
         const auto outer_indices = IFV.outerIndexPtr();
-        const auto inner_indices = IFV.innerIndexPtr();
         for (Eigen::Index i = 0; i < IFV.outerSize(); i++) {
             const auto start = outer_indices[i];
             const auto end = outer_indices[i + 1];
             const auto size = end - start;
-            const auto I1 = Eigen::Matrix<decltype(IFV)::Scalar, Eigen::Dynamic, 1>::Map(IFV.valuePtr() + start, size);
-            const auto I2 = Eigen::Matrix<SpMat::StorageIndex, Eigen::Dynamic, 1>::Map(inner_indices + start, size);
-            Eigen::VectorXd::Map(values + start, size) = (G(I1, Eigen::placeholders::all).array() * B(I2, Eigen::placeholders::all).array()).rowwise().sum();
+            const auto I = Eigen::Matrix<decltype(IFV)::Scalar, Eigen::Dynamic, 1>::Map(IFV.valuePtr() + start, size);
+            Eigen::VectorXd::Map(values + start, size) = (G(I, Eigen::placeholders::all) * B.row(i).transpose());
         }
     };
 
@@ -554,9 +553,9 @@ void FlattenSurface::slim_solve(const std::size_t n_iterations) {
     {
         std::vector<double> temp(IFV.nonZeros());
         assemble_gradient_values(B1, temp.data());
-        DX = SpMat::Map(IFV.rows(), IFV.cols(), IFV.nonZeros(), IFV.outerIndexPtr(), IFV.innerIndexPtr(), temp.data());
+        DX = RowSpMat::Map(IFV.rows(), IFV.cols(), IFV.nonZeros(), IFV.outerIndexPtr(), IFV.innerIndexPtr(), temp.data());
         assemble_gradient_values(B2, temp.data());
-        DY = SpMat::Map(IFV.rows(), IFV.cols(), IFV.nonZeros(), IFV.outerIndexPtr(), IFV.innerIndexPtr(), temp.data());
+        DY = RowSpMat::Map(IFV.rows(), IFV.cols(), IFV.nonZeros(), IFV.outerIndexPtr(), IFV.innerIndexPtr(), temp.data());
     }
 
     VMat4 J(B1.rows(), 4);
@@ -579,10 +578,8 @@ void FlattenSurface::slim_solve(const std::size_t n_iterations) {
     double energy = 0.0;
 
     const auto update_jacobian = [&J, &DX, &DY](const VMat2& uv) noexcept {
-        J.col(0) = DX * uv.col(0);
-        J.col(1) = DX * uv.col(1);
-        J.col(2) = DY * uv.col(0);
-        J.col(3) = DY * uv.col(1);
+        J.leftCols(2) = DX * uv;
+        J.rightCols(2) = DY * uv;
     };
 
     const auto compute_energy = [&update_jacobian, &DA, &J, &ri, &ti, &ui, &si, &vi](const VMat2& uv) noexcept {
