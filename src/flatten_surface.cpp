@@ -4,7 +4,9 @@
 #include <igl/polar_svd.h>
 #include <fmt/format.h>
 
-# include <algorithm>
+#include <algorithm>
+#include <ranges>
+#include <utility>
 
 auto write_uv(const std::string& name, const VMat2& uv, const FMat& F) {
     std::ofstream file(name);
@@ -176,62 +178,11 @@ void fill_system_values(const RowSpMat& DX, const RowSpMat& DY, const VMat4& W, 
     }
 }
 
-auto transpose_sparse_matrix(const RowSpMat& A) noexcept {
-    const auto outer_indices = A.outerIndexPtr();
-    const auto inner_indices = A.innerIndexPtr();
-    const auto values = A.valuePtr();
-
-    RowSpMat dest(A.cols(), A.rows());
-    dest.resizeNonZeros(A.nonZeros());
-    auto new_outer_indices = dest.outerIndexPtr();
-    auto new_inner_indices = dest.innerIndexPtr();
-    auto new_values = dest.valuePtr();
-
-    RowSpMat::IndexVector::Map(new_outer_indices, dest.outerSize()).setZero();
-    for (Eigen::Index i = 0; i < A.outerSize(); i++) {
-        for (RowSpMat::InnerIterator it(A, i); it; ++it) {
-            new_outer_indices[it.index()]++;
-        }
-    }
-
-    RowSpMat::IndexVector positions(dest.outerSize());
-    RowSpMat::IndexVector old_to_new_indices(A.nonZeros());
-    RowSpMat::StorageIndex count = 0;
-    for (Eigen::Index i = 0; i < dest.outerSize(); i++) {
-        auto temp = new_outer_indices[i];
-        new_outer_indices[i] = count;
-        positions[i] = count;
-        count += temp;
-    }
-    new_outer_indices[dest.outerSize()] = count;
-
-    for (Eigen::Index i = 0; i < A.outerSize(); i++) {
-        const auto start = outer_indices[i];
-        const auto end = outer_indices[i + 1];
-        for (Eigen::Index j = start; j < end; j++) {
-            const auto pos = positions[inner_indices[j]]++;
-            new_inner_indices[pos] = i;
-            new_values[pos] = values[j];
-            old_to_new_indices[j] = pos;
-        }
-    }
-    return std::make_tuple(std::move(dest), std::move(old_to_new_indices));
-}
-
 /**
- * Cache sparsity/index data to assemble the normal matrix L = At * M * A efficiently.
+ * Cache sparsity/index data to assemble the normal matrix L = A^T * M * A.
  *
- * Usage:
- *  - call build(At) once to create an empty L with the correct sparsity and
- *    record index mappings between At entries and L.
- *  - call assign(At, M, L) to fill numeric values given a diagonal weight M.
- *
- * Stored mappings:
- *  - block_entry_offsets: prefix sums over matching entry pairs per L entry.
- *  - left_entry_indices/right_entry_indices: matching (row,col) entry indices in At
- *    that contribute to each upper-triangular entry in L.
- *  - upper_inner_positions: positions in L for the upper triangle entries.
- *  - lower_inner_positions/lower_to_upper_map: mirror positions for the lower triangle.
+ * Each row of A is tiny, so building L from local row outer-products avoids
+ * intersecting every pair of rows in A^T.
  */
 struct NormalMatrixCache {
     using StorageIndex = RowSpMat::StorageIndex;
@@ -239,99 +190,121 @@ struct NormalMatrixCache {
     using ScalarVector = RowSpMat::ScalarVector;
 
     NormalMatrixCache() noexcept = default;
-    auto build(const RowSpMat& At) noexcept;
-    void assign(const RowSpMat& At, const Eigen::VectorXd& M, RowSpMat& L) noexcept;
+    auto build(const RowSpMat& A) noexcept;
+    void assign(const RowSpMat& A, const Eigen::VectorXd& M, RowSpMat& L) noexcept;
 
-    std::vector<StorageIndex> block_entry_offsets;      // prefix sums delimiting contributing pairs per L entry
-    std::vector<StorageIndex> left_entry_indices;       // indices of At entries on the left side (row)
-    std::vector<StorageIndex> right_entry_indices;      // matching At entries on the right side (col)
-    std::vector<StorageIndex> upper_inner_positions;    // positions in L for upper triangle entries
-    std::vector<StorageIndex> lower_inner_positions;    // positions in L for lower triangle entries
-    std::vector<StorageIndex> lower_to_upper_map;       // mapping from lower positions to corresponding upper positions
+    std::vector<StorageIndex> left_entry_indices;    // A value index for the left factor of each contribution
+    std::vector<Eigen::Index> contribution_rows;     // A row / M diagonal index for each contribution
+    std::vector<StorageIndex> right_entry_indices;   // A value index for the right factor of each contribution
+    std::vector<StorageIndex> normal_entry_indices;  // destination value index in L
 };
 
-auto NormalMatrixCache::build(const RowSpMat& At) noexcept {
-    const auto outer_ptr = At.outerIndexPtr();  // row pointers of At
-    const auto inner_ptr = At.innerIndexPtr();  // column indices of At
-    const auto values = At.valuePtr();
-    constexpr RowSpMat::StorageIndex INVALID = -1;
+/**
+ * Build the sparsity pattern for L = A^T * M * A and cache how each local
+ * product maps into L.valuePtr().
+ *
+ * For one sparse row r of A, the normal matrix contribution is the dense outer
+ * product over that row's active columns:
+ *
+ *   L(i, j) += A(r, i) * M(r) * A(r, j)
+ *
+ * Therefore every pair of nonzeros in the same row of A defines one possible
+ * nonzero coordinate (i, j) in L.  The numeric weights are iteration-dependent,
+ * but this coordinate pattern is fixed as long as A's sparsity is fixed.
+ *
+ * The cached arrays follow the exact same nested loop order.  For contribution
+ * k, left_entry_indices[k], contribution_rows[k], and right_entry_indices[k]
+ * identify the product factors in A and M; normal_entry_indices[k] identifies
+ * the slot in L.valuePtr() that receives the contribution.
+ */
+auto NormalMatrixCache::build(const RowSpMat& A) noexcept {
+    const auto outer_ptr = A.outerIndexPtr();  // row pointers of A
+    const auto inner_ptr = A.innerIndexPtr();  // column indices of A
 
-    block_entry_offsets.emplace_back(0);
-    std::vector<StorageIndex> normal_outer{0};          // outer pointer for L
-    std::vector<StorageIndex> normal_inner;             // inner indices for L
-    std::vector<StorageIndex> col_head(At.outerSize(), INVALID); // head of per-column linked list
-    std::vector<StorageIndex> col_tail(At.outerSize(), INVALID); // tail of per-column linked list
-    std::vector<StorageIndex> col_next;                 // next pointers for linked list
-    std::vector<StorageIndex> row_of_inner;             // row index for each L entry (mirrored)
-    for (Eigen::Index row = 0; row < At.outerSize(); row++) {
-        // setup left part
-        auto curr = col_head[row];
-        while(curr != INVALID) {
-            lower_inner_positions.emplace_back(normal_inner.size()); // position in lower triangle
-            lower_to_upper_map.emplace_back(curr); // map to corresponding upper entry
-            normal_inner.emplace_back(row_of_inner[curr]); // mirror column
-            row_of_inner.emplace_back(INVALID);
-            col_next.emplace_back(INVALID);
-            curr = col_next[curr];
-        }
-        for (Eigen::Index col = row; col < At.outerSize(); col++) {
-            auto right_it = outer_ptr[col];
-            for (StorageIndex left_it = outer_ptr[row]; left_it < outer_ptr[row + 1]; left_it++) {
-                const auto left_inner_idx = inner_ptr[left_it];
-                while(right_it < outer_ptr[col + 1] && inner_ptr[right_it] < left_inner_idx) {
-                    right_it++;
-                }
+    left_entry_indices.clear();
+    contribution_rows.clear();
+    right_entry_indices.clear();
+    normal_entry_indices.clear();
 
-                if (right_it == outer_ptr[col + 1]) {
-                    break;
-                }
-
-                if (inner_ptr[right_it] == left_inner_idx) {
-                    left_entry_indices.emplace_back(left_it);
-                    right_entry_indices.emplace_back(right_it);
-                    right_it++;
-                    if (right_it == outer_ptr[col + 1]) {
-                        break;
-                    }
-                }
-            }
-            if (left_entry_indices.size() != block_entry_offsets.back()) {
-                block_entry_offsets.emplace_back(left_entry_indices.size());
-                const StorageIndex new_inner_idx = normal_inner.size();
-                col_next.emplace_back(INVALID);
-                row_of_inner.emplace_back(row);
-                normal_inner.emplace_back(col);
-                upper_inner_positions.emplace_back(new_inner_idx);
-                if (col_head[col] == INVALID) {
-                    col_head[col] = new_inner_idx;
-                    col_tail[col] = new_inner_idx;
-                } else {
-                    col_next[col_tail[col]] = new_inner_idx;
-                    col_tail[col] = new_inner_idx;
-                }
-            }
-        }
-        normal_outer.emplace_back(normal_inner.size());
+    // Count row-local outer-product terms.  This is not the final number of
+    // nonzeros in L because multiple A rows can contribute to the same L entry;
+    // it is the number of cached product destinations assign() will replay.
+    std::size_t contribution_count = 0;
+    for (Eigen::Index row = 0; row < A.outerSize(); row++) {
+        const auto start = outer_ptr[row];
+        const auto end = outer_ptr[row + 1];
+        const auto row_size = end - start;
+        contribution_count += static_cast<std::size_t>(row_size) * static_cast<std::size_t>(row_size);
     }
 
-    RowSpMat L(At.outerSize(), At.outerSize());
-    L.resizeNonZeros(normal_inner.size());
-    IndexVector::Map(L.outerIndexPtr(), normal_outer.size()) = IndexVector::Map(normal_outer.data(), normal_outer.size());
-    IndexVector::Map(L.innerIndexPtr(), normal_inner.size()) = IndexVector::Map(normal_inner.data(), normal_inner.size());
+    // Emit one triplet for every possible local contribution.  setFromTriplets()
+    // sorts and coalesces duplicate coordinates, leaving L with the union of all
+    // positions touched by A^T * M * A.  The triplet values are placeholders
+    // because assign() overwrites L's numeric values every iteration.
+    std::vector<Eigen::Triplet<double>> triplets;
+    triplets.reserve(contribution_count);
+    for (Eigen::Index row = 0; row < A.outerSize(); row++) {
+        const auto start = outer_ptr[row];
+        const auto end = outer_ptr[row + 1];
+        for (StorageIndex left_it = start; left_it < end; left_it++) {
+            const auto left_col = inner_ptr[left_it];
+            for (StorageIndex right_it = start; right_it < end; right_it++) {
+                triplets.emplace_back(left_col, inner_ptr[right_it], 0.0);
+            }
+        }
+    }
+
+    RowSpMat L(A.cols(), A.cols());
+    L.setFromTriplets(triplets.begin(), triplets.end());
+
+    const auto normal_outer = L.outerIndexPtr();
+    const auto normal_inner = L.innerIndexPtr();
+    left_entry_indices.reserve(contribution_count);
+    contribution_rows.reserve(contribution_count);
+    right_entry_indices.reserve(contribution_count);
+    normal_entry_indices.reserve(contribution_count);
+
+    // Build the replay map.  For each local pair (left_col, right_col), find the
+    // corresponding storage index in row left_col of L.  Both the A row's column
+    // list and L's inner-index slice are sorted, so a single advancing cursor is
+    // enough for all right_col values for the current left_col.  Store the A/M
+    // indices in the same order so assign() can replay without traversing A.
+    for (Eigen::Index row = 0; row < A.outerSize(); row++) {
+        const auto start = outer_ptr[row];
+        const auto end = outer_ptr[row + 1];
+        for (StorageIndex left_it = start; left_it < end; left_it++) {
+            const auto left_col = inner_ptr[left_it];
+            auto normal_it = normal_outer[left_col];
+            const auto normal_end = normal_outer[left_col + 1];
+            for (StorageIndex right_it = start; right_it < end; right_it++) {
+                const auto right_col = inner_ptr[right_it];
+                while (normal_it < normal_end && normal_inner[normal_it] < right_col) {
+                    normal_it++;
+                }
+                left_entry_indices.emplace_back(left_it);
+                contribution_rows.emplace_back(row);
+                right_entry_indices.emplace_back(right_it);
+                normal_entry_indices.emplace_back(normal_it);
+            }
+        }
+    }
+
     return L;
 }
 
-void NormalMatrixCache::assign(const RowSpMat& At, const Eigen::VectorXd& M, RowSpMat& L) noexcept {
-    const auto at_values = ScalarVector::Map(At.valuePtr(), At.nonZeros()); // values of At
-    const auto weighted_products = (at_values(left_entry_indices).array()
-        * M(IndexVector::Map(At.innerIndexPtr(), At.nonZeros())(left_entry_indices)).array()
-        * at_values(right_entry_indices).array()).eval(); // elementwise At * M * At
-    auto normal_values = ScalarVector::Map(L.valuePtr(), L.nonZeros()); // writable values of L
-    for (std::size_t block = 0; block < upper_inner_positions.size(); block++) {
-        normal_values[upper_inner_positions[block]] = weighted_products.segment(block_entry_offsets[block], block_entry_offsets[block + 1] - block_entry_offsets[block]).sum();
-    }
+void NormalMatrixCache::assign(const RowSpMat& A, const Eigen::VectorXd& M, RowSpMat& L) noexcept {
+    const auto a_values = A.valuePtr();
+    auto normal_values = ScalarVector::MapAligned(L.valuePtr(), L.nonZeros()); // writable values of L
+    normal_values.setZero();
+    auto A_values = ScalarVector::MapAligned(A.valuePtr(), A.nonZeros());
+    auto left_values = A_values(left_entry_indices).eval();
+    auto M_values = M(contribution_rows).eval();
+    auto right_values = A_values(right_entry_indices).eval();
+    auto product = (left_values.array() * M_values.array() * right_values.array()).eval();
 
-    normal_values(lower_inner_positions) = normal_values(lower_to_upper_map);
+    for (auto&& [idx, val] : std::views::zip(normal_entry_indices, product)) {
+        normal_values[idx] += val;
+    }
 }
 
 void assign_rhs(const VMat4& W, const VMat4& R, Eigen::VectorXd& rhs) noexcept {
@@ -343,23 +316,22 @@ void assign_rhs(const VMat4& W, const VMat4& R, Eigen::VectorXd& rhs) noexcept {
 }
 
 /*
- * Compute y = At * (diag(M) * b)
+ * Compute y = A^T * (diag(M) * b)
  */
-void multiply_normal_rhs(const RowSpMat& At, const Eigen::VectorXd& M, const Eigen::VectorXd& b, Eigen::VectorXd& rhs) noexcept {
-    const auto outer_ptr = At.outerIndexPtr();   // row pointers
-    const auto inner_ptr = At.innerIndexPtr();   // column indices
-    const auto values_ptr = At.valuePtr();       // nonzero values
+void multiply_normal_rhs(const RowSpMat& A, const Eigen::VectorXd& M, const Eigen::VectorXd& b, Eigen::VectorXd& rhs)
+    noexcept {
+    const auto outer_ptr = A.outerIndexPtr();   // row pointers
+    const auto inner_ptr = A.innerIndexPtr();   // column indices
+    const auto values_ptr = A.valuePtr();       // nonzero values
 
-    for (Eigen::Index row = 0; row < At.outerSize(); ++row) {
+    rhs.setZero();
+    for (Eigen::Index row = 0; row < A.outerSize(); ++row) {
         const auto start = outer_ptr[row];
         const auto end = outer_ptr[row + 1];
-        const auto nnz = end - start;
-        const auto col_ids = RowSpMat::IndexVector::Map(inner_ptr + start, nnz); // columns in this row
-        rhs[row] = (RowSpMat::ScalarVector::Map(values_ptr + start, nnz).array()
-            * M(col_ids).array())
-            .matrix()
-            .transpose()
-            * b(col_ids);
+        const auto weighted_rhs = M[row] * b[row];
+        for (RowSpMat::StorageIndex it = start; it < end; it++) {
+            rhs[inner_ptr[it]] += values_ptr[it] * weighted_rhs;
+        }
     }
 }
 double get_smallest_pos_quad_zero(const double a,const double b, const double c) noexcept
@@ -565,11 +537,9 @@ void FlattenSurface::slim_solve(const std::size_t n_iterations) {
     Eigen::Matrix2d ji, ri, ti, ui, vi;
     Eigen::Vector2d si, swi;
     RowSpMat A;
-    RowSpMat At;
     NormalMatrixCache normal_cache;
     RowSpMat L;
     std::vector<Eigen::Index> skip_indices;
-    RowSpMat::IndexVector A_to_At_indices;
     Eigen::VectorXd boundary_rhs(B1.rows() * 4);
     Eigen::VectorXd rhs(B1.rows() * 4);
     Eigen::VectorXd real_rhs(n_free * 2);
@@ -611,25 +581,17 @@ void FlattenSurface::slim_solve(const std::size_t n_iterations) {
         assign_rhs(W, R, rhs);
         rhs -= boundary_rhs;
 
-        if (A_to_At_indices.size() == 0) {
-            std::tie(At, A_to_At_indices) = transpose_sparse_matrix(A);
-        } else {
-            RowSpMat::ScalarVector::Map(At.valuePtr(), A.nonZeros())(A_to_At_indices) = RowSpMat::ScalarVector::Map(A.valuePtr(), A.nonZeros());
-        }
-
         if (L.size() == 0) {
-            L = normal_cache.build(At);
+            L = normal_cache.build(A);
         }
-        RowSpMat L_temp = At * A;
-        normal_cache.assign(At, DDA, L);
-        multiply_normal_rhs(At, DDA, rhs, real_rhs);
+        normal_cache.assign(A, DDA, L);
+        multiply_normal_rhs(A, DDA, rhs, real_rhs);
 
         Eigen::SimplicialLDLT<Eigen::SparseMatrix<double> > solver;
         new_uv.bottomRows(V.rows() - n_bnd_points).reshaped() = solver.compute(L).solve(real_rhs);
         energy = flip_avoiding_line_search(F, uv, new_uv, compute_energy, energy);
-        uv = new_uv;
         std::cout << "Energy: " << energy << std::endl;
-
+        uv = new_uv;
     }
     write_uv(fmt::format("uv_new.obj"), new_uv, F);
 }
