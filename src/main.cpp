@@ -18,6 +18,7 @@
 #include <CLI/CLI.hpp>
 
 #include <Eigen/Core>
+#include <Eigen/Geometry>
 #include <array>
 #include <cstddef>
 #include <cstdio>
@@ -50,6 +51,7 @@
 
 #include "eigen_alias.h"
 #include "flatten_surface.h"
+#include "fit_on_surface.h"
 #include "geometrycentral/surface/manifold_surface_mesh.h"
 #include "geometrycentral/surface/vertex_position_geometry.h"
 #include "geometrycentral/utilities/utilities.h"
@@ -59,6 +61,7 @@
 #include <cmath>
 #include <iostream>
 #include <limits>
+#include <numbers>
 #include <optional>
 #include <ranges>
 #include <string>
@@ -1950,10 +1953,81 @@ void long_time_slim() {
     // ds.deform(10, newV);
     VMat2 uv1 = uv;
     FlattenSurface fs(std::move(V), std::move(F), uv1, 0);
+    auto start = std::chrono::high_resolution_clock::now();
     fs.slim_solve(10);
+    auto end = std::chrono::high_resolution_clock::now();
+    std::cout << "Time: " << std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count() << "ms" << std::endl;
+}
+
+void test_fit_on_surface(const std::string& mesh_path) {
+    std::vector<Point_3> mesh_points;
+    std::vector<std::vector<std::size_t>> mesh_faces;
+    if (!CGAL::IO::read_polygon_soup(mesh_path, mesh_points, mesh_faces)) {
+        fmt::print(stderr, "Failed to load relief mesh from {}\n", mesh_path);
+        return;
+    }
+
+    auto mesh = fit_on_surface::Mesh::new_in(std::move(mesh_faces));
+    for (auto&& [p, v] : std::views::zip(mesh_points, mesh.vertices())) {
+        auto& pt = v.prop().pt;
+        pt[0] = p.x();
+        pt[1] = p.y();
+        pt[2] = p.z();
+    }
+
+    // make data
+    const auto inner_radius = 0.7;
+    const double start_theta = -std::numbers::pi / 4.0;
+    const Eigen::Vector2d start_dir{
+        std::cos(start_theta) * inner_radius,
+        std::sin(start_theta) * inner_radius,
+    };
+    const std::size_t n_refines = 8;
+    const auto stride_angle = std::numbers::pi / (n_refines * 2);
+    const std::size_t n_circle_samples = n_refines * 4;
+
+    std::vector<std::array<double, 2>> polygon_points{{1.0, 0.0}, {1.0, 1.0}, {0.0, 1.0}, {0.0, 0.0}};
+    polygon_points.reserve(polygon_points.size() + n_circle_samples);
+    Eigen::Vector2d dir = start_dir;
+    const Eigen::Rotation2D<double> rotation(stride_angle);
+    for (std::size_t i = 0; i < n_circle_samples; ++i) {
+        polygon_points.push_back({dir.x(), dir.y()});
+        dir = rotation * dir;
+    }
+
+    std::vector<std::vector<std::vector<std::size_t>>> polygons;
+    for (std::size_t i{0}; i < std::size_t{4}; i++) {
+        std::vector<std::size_t> polygon {std::size_t{4} + i * n_refines, i, (i + 1) % std::size_t{4}};
+
+        for (std::size_t j{0}; j < n_refines; j++) {
+            polygon.push_back(std::size_t{4} + ((i + 1) * n_refines - j) % n_circle_samples);
+        }
+
+        polygons.push_back({std::move(polygon)});
+    }
+    const gpf::FaceId fid{9860};
+    std::array<double, 3> start_pt{};
+    std::vector<gpf::VertexId> vertices = mesh.face(fid).halfedges() | std::views::transform([](auto&& h) { return h.from().id; }) | std::ranges::to<std::vector<gpf::VertexId>>();
+    Eigen::Vector3d::Map(start_pt.data()) = Eigen::Vector3d::Map(mesh.vertex_prop(vertices[0]).pt.data()) * 0.3 + Eigen::Vector3d::Map(mesh.vertex_prop(vertices[1]).pt.data()) * 0.3 + Eigen::Vector3d::Map(mesh.vertex_prop(vertices[2]).pt.data()) * 0.4;
+
+    for (auto face : mesh.faces()) {
+        face.prop().parent = face.id;;
+    }
+
+    fit_polygon_on_surface(mesh, polygon_points, polygons, start_pt, fid, {0.3, 0.0, 0.0});
+
+    const auto a = 2;
 }
 
 int main(int argc, char** argv) {
+    CLI::App app { "Fit App" };
+    std::string mesh_path;
+    std::string relief_path;
+    app.add_option("-m,--mesh", mesh_path, "Path to mesh file")->required();
+    app.add_option("-r,--relief", relief_path, "Path to relief file")->required();
+    CLI11_PARSE(app, argc, argv);
+
+    test_fit_on_surface(mesh_path);
     long_time_slim();
     return 0;
 }

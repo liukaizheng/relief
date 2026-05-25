@@ -37,10 +37,15 @@ CPMAddPackage(
     OPTIONS
         "LIBIGL_RESTRICTED_TRIANGLE ON"
 )
+# CPMAddPackage("gh:liukaizheng/gpf-algorithm#main")
+CPMAddPackage(
+    NAME gpf-algorithm
+    SOURCE_DIR ${CMAKE_CURRENT_LIST_DIR}/../gpf-algorithm
+)
 
 add_executable(relief_app
     src/flatten_surface.cpp
-    src/deform_surface.cpp
+    src/fit_on_surface.cpp
     src/main.cpp
 )
 target_compile_features(relief_app PRIVATE cxx_std_23)
@@ -52,6 +57,7 @@ target_link_libraries(relief_app PRIVATE
     geometry-central
     igl::core
     igl_restricted::triangle
+    gpf::algorithm
 )
 target_include_directories(relief_app PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
