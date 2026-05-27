@@ -1952,7 +1952,7 @@ void long_time_slim() {
     // DeformSurface ds(std::move(V), std::move(F), bnd.size());
     // ds.deform(10, newV);
     VMat2 uv1 = uv;
-    FlattenSurface fs(std::move(V), std::move(F), uv1, 0);
+    FlattenSurface fs(std::move(V), std::move(F), std::move(uv1), 0);
     auto start = std::chrono::high_resolution_clock::now();
     fs.slim_solve(10);
     auto end = std::chrono::high_resolution_clock::now();

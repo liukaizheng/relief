@@ -413,7 +413,7 @@ double flip_avoiding_line_search(const FMat& F, const VMat2& uv, VMat2& new_uv, 
     const auto t = get_min_pos_root_2D(F, uv, d);
     return line_search(uv, d, new_uv, compute_energy, energy, t);
 }
-FlattenSurface::FlattenSurface(VMat &&V, FMat &&F, VMat2& uv, const std::size_t n_bnd_points) noexcept : V(std::move(V)), F(std::move(F)), uv(std::move(uv)), n_bnd_points(n_bnd_points) {
+FlattenSurface::FlattenSurface(VMat &&V, FMat &&F, VMat2&& uv, const std::size_t n_bnd_points) noexcept : V(std::move(V)), F(std::move(F)), uv(std::move(uv)), n_bnd_points(n_bnd_points) {
 }
 
 FlattenSurface::FlattenSurface(VMat &&V, FMat &&F, const std::size_t n_boundary_points) noexcept : V(std::move(V)), F(std::move(F)), n_bnd_points(0) {

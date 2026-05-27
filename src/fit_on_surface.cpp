@@ -3,7 +3,6 @@
 #include "flatten_surface.h"
 
 #include <array>
-#include <gpf/ids.hpp>
 #include <gpf/mesh_flood_fill.hpp>
 #include <gpf/project_polylines_on_mesh.hpp>
 
@@ -138,7 +137,7 @@ auto extract_face_mesh(
             v_data += 3;
         }
     }
-    return std::make_tuple(n_boundary_vertices, std::move(V), std::move(F));
+    return std::make_tuple(n_boundary_vertices, std::move(vertex_map), std::move(face_vertices), std::move(V), std::move(F));
 }
 
 inline auto face_point(const auto& mesh, const gpf::FaceId fid, const std::span<const double, 3> bary_coords) {
@@ -151,6 +150,63 @@ inline auto face_point(const auto& mesh, const gpf::FaceId fid, const std::span<
     Eigen::Vector3d::Map(result.data()) = pa * bary_coords[0] + pb * bary_coords[1] + pc * bary_coords[2];
     return result;
 }
+
+inline std::size_t find_anchor_corner_index(const VMat2& uv, const std::span<const std::size_t> vertices) {
+    Eigen::Vector2d center = uv.row(vertices[0]).transpose();
+    return ranges::min(views::zip(vertices.subspan(1), ranges::iota_view{std::size_t{1}, std::size_t{5}}) |
+        views::transform([&uv, &center](auto&& pair) { return std::make_pair(
+            (uv.row(std::get<0>(pair)).transpose() - center).squaredNorm(),
+            std::get<1>(pair)
+        ); }), {}, &std::pair<double, std::size_t>::first).second;
+}
+
+bool boundary_contains_anchor_rectangle(const VMat2& uv, const std::span<const std::size_t> vertices, const std::size_t min_idx, const std::size_t n_boundaries) {
+    Eigen::Vector2d center = uv.row(vertices[0]).transpose();
+    Eigen::Vector2d base_dir = uv.row(vertices[min_idx]).transpose() - center;
+    auto half_diag_len = base_dir.norm();
+    base_dir /= half_diag_len;
+    for (std::size_t i = 0; i < n_boundaries; ++i) {
+        Eigen::Vector2d v = uv.row(i).transpose() - center;
+        auto actual_len = v.norm();
+        v /= actual_len;
+        auto angle_vec = gpf::detail::complex_div(v, base_dir);
+        auto expected_len = half_diag_len * std::abs(angle_vec[0]);  // cos(\theta) = angle_vec[0]
+        if (actual_len < expected_len) {
+            return false;
+        }
+    }
+    return true;
+}
+
+auto compute_anchor_uv_frame(const VMat2& uv, const std::span<const std::size_t> vertices, const std::size_t min_idx) {
+    Eigen::Vector2d center = uv.row(vertices[0]).transpose();
+    Eigen::Vector2d base_dir = uv.row(vertices[min_idx]).transpose() - center;
+    const auto angle = std::numbers::pi * (1.0 - 0.5 * min_idx); // rotate counterclockwise -0.5 * i * pi, then reverse
+    Eigen::Rotation2Dd rot(angle);
+    Eigen::Vector2d dir = rot * base_dir;
+    Eigen::Vector2d start_pt = center - dir;
+    const auto pi_4 = std::numbers::pi * 0.25;
+    Eigen::Vector2d xaxis = (Eigen::Rotation2Dd(-pi_4) * dir).normalized();
+    Eigen::Vector2d yaxis = (Eigen::Rotation2Dd(pi_4) * dir).normalized();
+    return std::make_tuple(std::move(start_pt), std::move(xaxis), std::move(yaxis));
+}
+
+auto map_polygon_to_uv_frame(const std::vector<std::array<double, 2>>& polygon_points, const Eigen::Vector2d& start_pt, const Eigen::Vector2d& xaxis, const Eigen::Vector2d& yaxis) {
+    return polygon_points | views::transform([&start_pt, &xaxis, &yaxis](auto&& point) {
+        std::array<double, 2> result;
+        Eigen::Vector2d::Map(result.data()) = start_pt + xaxis * point[0] + yaxis * point[1];
+        return result;
+    }) | ranges::to<std::vector>();
+}
+
+namespace uv {
+struct VertexProp {
+    std::array<double, 2> pt;
+};
+
+using Mesh = gpf::ManifoldMesh<VertexProp, gpf::Empty, gpf::Empty, fit_on_surface::FaceProp>;
+}
+
 } // unnamed namespace
 
 void fit_polygon_on_surface(
@@ -192,23 +248,27 @@ void fit_polygon_on_surface(
                 start_info = (*walk_ret)[0];
             }
             corner_points.push_back((*walk_ret)[1]);
-            const auto [fid, bary_coords] = (*walk_ret)[1];
+            const auto [fid, bary_coords] = (*walk_ret)[2];
             outer_corner_points.push_back(face_point(mesh, fid, bary_coords));
         } else {
             throw std::runtime_error("walk_on_mesh_surface failed");
         }
         dir = (quat * dir).eval();
     }
+    {
+        auto [fid, bary_coords] = start_info.value();
+        outer_corner_points.push_back(face_point(mesh, fid, bary_coords));
+    }
+    for (auto [fid, bary_coords] : corner_points) {
+        outer_corner_points.push_back(face_point(mesh, fid, bary_coords));
+    }
 
-    auto boundary_paths = std::get<1>(gpf::project_polylines_on_mesh(
+    auto [project_vertices, boundary_paths] = gpf::project_polylines_on_mesh(
         outer_corner_points,
         std::vector<std::vector<std::size_t>> { { 0, 1, 2, 3, 0 } },
-        mesh));
-    if (boundary_paths.empty() || boundary_paths.front().empty()) {
-        throw std::runtime_error("failed to project boundary polyline on mesh");
-    }
+        mesh);
     auto inner_faces = gpf::surround_faces_by_halfedges(mesh, boundary_paths.front());
-    auto [n_boundary_vertices, V, F] = extract_face_mesh(mesh, boundary_paths.front(), inner_faces);
+    auto [n_boundary_vertices, vertex_map, inner_face_indices, V, F] = extract_face_mesh(mesh, boundary_paths.front(), inner_faces);
     const auto bnd = Eigen::VectorXi::LinSpaced(
         static_cast<Eigen::Index>(n_boundary_vertices),
         0,
@@ -233,10 +293,33 @@ void fit_polygon_on_surface(
     // fixes only the translation gauge; it does not otherwise constrain the
     // local SLIM distortion minimization.  See
     // docs/SLIM_ldlt_nullspace_explanation.md for the full derivation.
-    FlattenSurface fs(std::move(V), std::move(F), uv, 1);
+    FlattenSurface fs(std::move(V), std::move(F), std::move(uv), 1);
     fs.slim_solve(5);
     write_uv_as_off(fs.uv, fs.F, "fit_polygon_on_surface_uv.off");
     write_faces_as_off(mesh, inner_faces, "fit_polygon_on_surface.off");
 
+    const std::vector<std::size_t> corner_indices = std::span<const gpf::VertexId>{project_vertices.data() + project_vertices.size() - 5, 5} | views::transform([&vertex_map](auto vid) { return vertex_map[vid.idx]; }) | ranges::to<std::vector>();
+    if (ranges::any_of(corner_indices, [](auto idx) { return idx == gpf::kInvalidIndex; })) {
+        throw std::runtime_error("Invalid vertex index in corner_indices");
+    }
+
+    const auto anchor_idx = find_anchor_corner_index(fs.uv, corner_indices);
+    if (!boundary_contains_anchor_rectangle(fs.uv, corner_indices, anchor_idx, n_boundary_vertices)) {
+        throw std::runtime_error("Failed to fit polygon on surface");
+    }
+
+    auto uv_mesh = uv::Mesh::new_in(ranges::iota_view{std::size_t{0}, inner_faces.size()} | views::transform([&inner_face_indices](auto idx) { return  std::span<const std::size_t, 3>{inner_face_indices.data() + idx * 3, 3}; }));
+    for (auto v : uv_mesh.vertices()) {
+        auto row = fs.uv.row(static_cast<Eigen::Index>(v.id.idx));
+        v.prop().pt = {row(0), row(1)};
+    }
+
+    for (auto face : uv_mesh.faces()) {
+        face.prop().parent = mesh.face_prop(inner_faces[static_cast<std::size_t>(face.id.idx)]).parent;
+        assert(face.prop().parent.valid());
+    }
+
+    const auto [start_pt, xaxis, yaxis] = compute_anchor_uv_frame(fs.uv, corner_indices, anchor_idx);
+    auto poly_uv_pts = map_polygon_to_uv_frame(polygon_points, start_pt, xaxis, yaxis);
     const auto a = 2;
 }
