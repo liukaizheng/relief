@@ -192,7 +192,7 @@ void fit_polygon_on_surface(
                 start_info = (*walk_ret)[0];
             }
             corner_points.push_back((*walk_ret)[1]);
-            const auto [fid, bary_coords] = (*walk_ret)[2];
+            const auto [fid, bary_coords] = (*walk_ret)[1];
             outer_corner_points.push_back(face_point(mesh, fid, bary_coords));
         } else {
             throw std::runtime_error("walk_on_mesh_surface failed");
@@ -221,7 +221,19 @@ void fit_polygon_on_surface(
     if (igl::flipped_triangles(uv, F).size() != 0) {
         igl::harmonic(F, bnd, bnd_uv, 1, uv); // use uniform laplacian
     }
-    FlattenSurface fs(std::move(V), std::move(F), uv, 0);
+    // Treat vertex 0 as a fixed UV gauge during the SLIM global step.  The
+    // SLIM matrix is assembled from gradients, so with 0 fixed vertices the
+    // normal equation has two exact translation null modes: adding a constant
+    // to every u coordinate or every v coordinate leaves all triangle
+    // Jacobians unchanged.  That makes A^T M A positive semidefinite, and
+    // Eigen::SimplicialLDLT can encounter a zero Schur-complement pivot even
+    // when all original matrix entries are finite and the RHS is compatible.
+    // Passing 1 removes vertex 0 from the free unknowns and anchors both its u
+    // and v values to the harmonic initialization.  For a connected patch this
+    // fixes only the translation gauge; it does not otherwise constrain the
+    // local SLIM distortion minimization.  See
+    // docs/SLIM_ldlt_nullspace_explanation.md for the full derivation.
+    FlattenSurface fs(std::move(V), std::move(F), uv, 1);
     fs.slim_solve(5);
     write_uv_as_off(fs.uv, fs.F, "fit_polygon_on_surface_uv.off");
     write_faces_as_off(mesh, inner_faces, "fit_polygon_on_surface.off");
