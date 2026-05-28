@@ -5,6 +5,7 @@
 #include <fmt/format.h>
 
 #include <algorithm>
+#include <numbers>
 #include <ranges>
 #include <utility>
 
@@ -96,7 +97,7 @@ auto tri_gradients(const Eigen::MatrixBase<DerivedV>& vertices, const Eigen::Mat
  *    and must be skipped when forming the free-vertex system.
  */
 auto build_system_pattern(const RowSpMat& DX, const Eigen::Index n_fixed) noexcept {
-    using IVec = Eigen::Matrix<RowSpMat::StorageIndex, 1, Eigen::Dynamic, Eigen::RowMajor>;
+    using IdxVec = Eigen::Matrix<RowSpMat::StorageIndex, 1, Eigen::Dynamic, Eigen::RowMajor>;
     using Mat4 = Eigen::Matrix<RowSpMat::StorageIndex, 4, Eigen::Dynamic, Eigen::RowMajor>;
     const auto n_free = DX.innerSize() - n_fixed; // number of free vertices
     std::vector<RowSpMat::StorageIndex> pattern_outer(DX.outerSize() * 4 + 1); // row pointer for 4x block rows
@@ -115,12 +116,12 @@ auto build_system_pattern(const RowSpMat& DX, const Eigen::Index n_fixed) noexce
         dx_start += skip_counts[i];
         const auto row_size = dx_end - dx_start; // free entries in this row
         const auto row_double = row_size * 2; // duplicated for u/v
-        const auto row_inner_indices = IVec::Map(dx_inner_ptr + dx_start, row_size).array(); // free vertex ids
+        const auto row_inner_indices = IdxVec::Map(dx_inner_ptr + dx_start, row_size).array(); // free vertex ids
         auto block_indices = Mat4::Map(pattern_inner.data() + value_cursor, 4, row_double); // 4x duplication block
         block_indices.leftCols(row_size) = (row_inner_indices - n_fixed).replicate<4, 1>();
         block_indices.rightCols(row_size) = (row_inner_indices + (n_free - n_fixed)).replicate<4, 1>();
 
-        IVec::Map(pattern_outer.data() + outer_cursor + 1, 4) = IVec::LinSpaced(4, value_cursor + row_double, value_cursor + row_double * 4);
+        IdxVec::Map(pattern_outer.data() + outer_cursor + 1, 4) = IdxVec::LinSpaced(4, value_cursor + row_double, value_cursor + row_double * 4);
         value_cursor += row_double * 4;
         outer_cursor += 4;
     }
@@ -293,7 +294,6 @@ auto NormalMatrixCache::build(const RowSpMat& A) noexcept {
 }
 
 void NormalMatrixCache::assign(const RowSpMat& A, const Eigen::VectorXd& M, RowSpMat& L) noexcept {
-    const auto a_values = A.valuePtr();
     auto normal_values = ScalarVector::MapAligned(L.valuePtr(), L.nonZeros()); // writable values of L
     normal_values.setZero();
     auto A_values = ScalarVector::MapAligned(A.valuePtr(), A.nonZeros());
@@ -422,7 +422,7 @@ FlattenSurface::FlattenSurface(VMat &&V, FMat &&F, const std::size_t n_boundary_
     bnd[n_boundary_points - 1] = 0;
     auto L = (this->V.topRows(n_boundary_points) - this->V(bnd, Eigen::placeholders::all)).rowwise().norm().eval();
     const auto l = L.sum();
-    const auto r = l / (2 * M_PI);
+    const auto r = l / (2 * std::numbers::pi);
     L /= l;
     double theta = 0;
     for (Eigen::Index i = 0; i < n_boundary_points; ++i) {
@@ -430,7 +430,7 @@ FlattenSurface::FlattenSurface(VMat &&V, FMat &&F, const std::size_t n_boundary_
         L(i) = theta;
         theta += temp;
     }
-    L *= 2 * M_PI;
+    L *= 2 * std::numbers::pi;
 
     auto uv_slice = uv.topRows(n_boundary_points);
     uv_slice.col(0) = L.array().cos() * r;
@@ -501,8 +501,8 @@ FlattenSurface::FlattenSurface(VMat&& V, FMat&& F, const std::vector<std::size_t
 
 void FlattenSurface::slim_solve(const std::size_t n_iterations) {
     Eigen::Index n_free = this->V.rows() - n_bnd_points;
-    auto [B1, B2, N, DA, IFV, G] = tri_gradients(this->V, this->F);
-    this->N = N;
+    auto [B1, B2, normal, DA, IFV, G] = tri_gradients(this->V, this->F);
+    this->N = normal;
     DA /= DA.sum();
 
     // Compute per-face gradient dot-products for a barycentric basis vector B and
@@ -534,7 +534,7 @@ void FlattenSurface::slim_solve(const std::size_t n_iterations) {
     VMat4 R(B1.rows(), 4);
     VMat4 W(B1.rows(), 4);
 
-    Eigen::Matrix2d ji, ri, ti, ui, vi;
+    Eigen::Matrix2d ri, ti, ui, vi;
     Eigen::Vector2d si, swi;
     RowSpMat A;
     NormalMatrixCache normal_cache;
