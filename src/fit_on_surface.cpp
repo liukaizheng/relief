@@ -2,7 +2,9 @@
 #include "eigen_alias.h"
 #include "flatten_surface.h"
 
+#include <algorithm>
 #include <array>
+#include <cassert>
 #include <gpf/mesh_flood_fill.hpp>
 #include <gpf/project_polylines_on_mesh.hpp>
 
@@ -12,12 +14,16 @@
 
 #include <cmath>
 #include <fstream>
+#include <iterator>
+#include <map>
 #include <numbers>
 #include <optional>
 #include <ranges>
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace ranges = std::ranges;
@@ -185,9 +191,10 @@ auto compute_anchor_uv_frame(const VMat2& uv, const std::span<const std::size_t>
     Eigen::Rotation2Dd rot(angle);
     Eigen::Vector2d dir = rot * base_dir;
     Eigen::Vector2d start_pt = center - dir;
+    dir *= std::numbers::sqrt2;
     const auto pi_4 = std::numbers::pi * 0.25;
-    Eigen::Vector2d xaxis = (Eigen::Rotation2Dd(-pi_4) * dir).normalized();
-    Eigen::Vector2d yaxis = (Eigen::Rotation2Dd(pi_4) * dir).normalized();
+    Eigen::Vector2d xaxis = Eigen::Rotation2Dd(-pi_4) * dir;
+    Eigen::Vector2d yaxis = Eigen::Rotation2Dd(pi_4) * dir;
     return std::make_tuple(std::move(start_pt), std::move(xaxis), std::move(yaxis));
 }
 
@@ -199,12 +206,178 @@ auto map_polygon_to_uv_frame(const std::vector<std::array<double, 2>>& polygon_p
     }) | ranges::to<std::vector>();
 }
 
+enum class PolylineSide {
+    Left,
+    Right,
+};
+
+using OrientedPolylines = std::vector<std::vector<std::size_t>>;
+using PolylinePolygonSides = std::vector<std::pair<std::size_t, std::size_t>>;
+
+bool lexicographically_less(const std::vector<std::size_t>& lhs, const std::vector<std::size_t>& rhs)
+{
+    return ranges::lexicographical_compare(lhs, rhs);
+}
+
+struct PolylineVerticesLess {
+    bool operator()(const std::vector<std::size_t>& lhs, const std::vector<std::size_t>& rhs) const
+    {
+        return lexicographically_less(lhs, rhs);
+    }
+};
+
+std::vector<std::size_t> closed_rotation_from_anchor(
+    const std::vector<std::size_t>& cycle,
+    const std::size_t anchor,
+    const bool reverse)
+{
+    auto vertices = cycle;
+    std::rotate(vertices.begin(), vertices.begin() + static_cast<std::ptrdiff_t>(anchor), vertices.end());
+    if (reverse) {
+        ranges::reverse(vertices.begin() + 1, vertices.end());
+    }
+    vertices.push_back(vertices.front());
+    return vertices;
+}
+
+std::pair<std::vector<std::size_t>, PolylineSide> canonicalize_polyline(const std::vector<std::size_t>& vertices)
+{
+    if (vertices.front() == vertices.back()) {
+        const std::vector<std::size_t> cycle(vertices.begin(), vertices.end() - 1);
+        const auto min_iter = ranges::min_element(cycle);
+        const auto min_idx = static_cast<std::size_t>(std::distance(cycle.begin(), min_iter));
+        auto forward = closed_rotation_from_anchor(cycle, min_idx, false);
+        auto reversed = closed_rotation_from_anchor(cycle, min_idx, true);
+        if (lexicographically_less(reversed, forward)) {
+            return { std::move(reversed), PolylineSide::Right };
+        }
+        return { std::move(forward), PolylineSide::Left };
+    }
+
+    auto reversed = vertices;
+    ranges::reverse(reversed);
+    if (lexicographically_less(reversed, vertices)) {
+        return { std::move(reversed), PolylineSide::Right };
+    }
+    return { vertices, PolylineSide::Left };
+}
+
+void add_oriented_polyline(
+    OrientedPolylines& polylines,
+    PolylinePolygonSides& polygon_sides,
+    std::map<std::vector<std::size_t>, std::size_t, PolylineVerticesLess>& polyline_index,
+    const std::vector<std::size_t>& vertices,
+    const std::size_t polygon_idx)
+{
+    auto [canonical_vertices, polygon_side] = canonicalize_polyline(vertices);
+    auto [iter, inserted] = polyline_index.emplace(canonical_vertices, polylines.size());
+    if (inserted) {
+        polylines.push_back(std::move(canonical_vertices));
+        polygon_sides.emplace_back(gpf::kInvalidIndex, gpf::kInvalidIndex);
+    }
+
+    auto& side_polygon = polygon_side == PolylineSide::Left
+        ? polygon_sides[iter->second].first
+        : polygon_sides[iter->second].second;
+    side_polygon = polygon_idx;
+}
+
 namespace uv {
 struct VertexProp {
     std::array<double, 2> pt;
 };
 
 using Mesh = gpf::ManifoldMesh<VertexProp, gpf::Empty, gpf::Empty, fit_on_surface::FaceProp>;
+}
+
+void write_uv_mesh_as_obj(const uv::Mesh& mesh, const std::string& path)
+{
+    std::ofstream file(path);
+    if (!file) {
+        throw std::runtime_error("failed to open UV mesh OBJ output file");
+    }
+
+    std::vector<std::size_t> vertex_indices(mesh.n_vertices_capacity(), gpf::kInvalidIndex);
+    std::size_t obj_vertex_idx = 1;
+    for (auto vertex : mesh.vertices()) {
+        vertex_indices[vertex.id.idx] = obj_vertex_idx++;
+        const auto& pt = vertex.prop().pt;
+        file << "v " << pt[0] << ' ' << pt[1] << " 0\n";
+    }
+
+    for (auto face : mesh.faces()) {
+        file << 'f';
+        for (auto halfedge : face.halfedges()) {
+            const auto vertex_idx = vertex_indices[halfedge.from().id.idx];
+            if (vertex_idx == gpf::kInvalidIndex) {
+                throw std::runtime_error("face references invalid UV mesh vertex");
+            }
+            file << ' ' << vertex_idx;
+        }
+        file << '\n';
+    }
+}
+
+std::pair<OrientedPolylines, PolylinePolygonSides> divide_polygons_into_oriented_polylines(
+    const std::vector<std::vector<std::vector<std::size_t>>>& polygons)
+{
+    std::vector<std::pair<std::size_t, std::vector<std::size_t>>> rings;
+    for (std::size_t polygon_idx = 0; polygon_idx < polygons.size(); ++polygon_idx) {
+        for (const auto& ring : polygons[polygon_idx]) {
+            rings.emplace_back(polygon_idx, ring);
+        }
+    }
+
+    std::unordered_map<std::size_t, std::size_t> vertex_incidence;
+    for (const auto& [polygon_idx, ring] : rings) {
+        for (std::size_t i = 0; i < ring.size(); ++i) {
+            ++vertex_incidence[ring[i]];
+            ++vertex_incidence[ring[(i + 1) % ring.size()]];
+        }
+    }
+
+    auto is_split_vertex = [&vertex_incidence](const std::size_t vertex_idx) {
+        const auto iter = vertex_incidence.find(vertex_idx);
+        return iter != vertex_incidence.end() && iter->second > 2;
+    };
+
+    OrientedPolylines polylines;
+    PolylinePolygonSides polygon_sides;
+    std::map<std::vector<std::size_t>, std::size_t, PolylineVerticesLess> polyline_index;
+    for (const auto& [polygon_idx, ring] : rings) {
+        std::vector<std::size_t> split_positions;
+        for (std::size_t i = 0; i < ring.size(); ++i) {
+            if (is_split_vertex(ring[i])) {
+                split_positions.push_back(i);
+            }
+        }
+
+        if (split_positions.empty()) {
+            auto vertices = ring;
+            vertices.push_back(vertices.front());
+            add_oriented_polyline(polylines, polygon_sides, polyline_index, vertices, polygon_idx);
+            continue;
+        }
+
+        for (std::size_t i = 0; i < split_positions.size(); ++i) {
+            const auto start = split_positions[i];
+            const auto end = split_positions[(i + 1) % split_positions.size()];
+            std::vector<std::size_t> vertices;
+
+            auto cursor = start;
+            while (true) {
+                vertices.push_back(ring[cursor]);
+                if (cursor == end && vertices.size() > 1) {
+                    break;
+                }
+                cursor = (cursor + 1) % ring.size();
+            }
+
+            add_oriented_polyline(polylines, polygon_sides, polyline_index, vertices, polygon_idx);
+        }
+    }
+
+    return { std::move(polylines), std::move(polygon_sides) };
 }
 
 } // unnamed namespace
@@ -321,5 +494,9 @@ void fit_polygon_on_surface(
 
     const auto [start_pt, xaxis, yaxis] = compute_anchor_uv_frame(fs.uv, corner_indices, anchor_idx);
     auto poly_uv_pts = map_polygon_to_uv_frame(polygon_points, start_pt, xaxis, yaxis);
-    const auto a = 2;
+    const auto [oriented_polylines, polyline_polygon_sides] =
+        divide_polygons_into_oriented_polylines(polygons);
+    (void)polyline_polygon_sides;
+    gpf::project_polylines_on_mesh(poly_uv_pts, oriented_polylines, uv_mesh);
+    write_uv_mesh_as_obj(uv_mesh, "fit_polygon_on_surface_projected_uv_mesh.obj");
 }

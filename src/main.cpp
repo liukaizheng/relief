@@ -1976,8 +1976,8 @@ void test_fit_on_surface(const std::string& mesh_path) {
     }
 
     // make data
-    const auto inner_radius = 0.7;
-    const double start_theta = -std::numbers::pi / 4.0;
+    constexpr double inner_radius = 0.5 * 0.7;
+    constexpr double start_theta = -std::numbers::pi / 4.0;
     const Eigen::Vector2d start_dir{
         std::cos(start_theta) * inner_radius,
         std::sin(start_theta) * inner_radius,
@@ -1991,7 +1991,7 @@ void test_fit_on_surface(const std::string& mesh_path) {
     Eigen::Vector2d dir = start_dir;
     const Eigen::Rotation2D<double> rotation(stride_angle);
     for (std::size_t i = 0; i < n_circle_samples; ++i) {
-        polygon_points.push_back({dir.x(), dir.y()});
+        polygon_points.push_back({dir.x() + 0.5, dir.y() + 0.5});
         dir = rotation * dir;
     }
 
