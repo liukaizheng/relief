@@ -330,33 +330,158 @@ namespace uv {
         std::array<double, 2> pt;
     };
 
-    using Mesh = gpf::ManifoldMesh<VertexProp, gpf::Empty, gpf::Empty, fit_on_surface::FaceProp>;
+    struct FaceProp {
+        gpf::FaceId parent;
+        std::size_t polygon_id = gpf::kInvalidIndex;
+    };
+
+    using Mesh = gpf::ManifoldMesh<VertexProp, gpf::Empty, gpf::Empty, FaceProp>;
 }
 
-void write_uv_mesh_as_obj(const uv::Mesh& mesh, const std::string& path)
+void set_face_polygon_id(uv::Mesh& mesh, const gpf::FaceId fid, const std::size_t polygon_id)
+{
+    if (!fid.valid() || polygon_id == gpf::kInvalidIndex) {
+        return;
+    }
+
+    auto& face_polygon_id = mesh.face_prop(fid).polygon_id;
+    if (face_polygon_id != gpf::kInvalidIndex && face_polygon_id != polygon_id) {
+        throw std::runtime_error("conflicting UV face polygon ids");
+    }
+    face_polygon_id = polygon_id;
+}
+
+void label_uv_mesh_polygon_ids(
+    uv::Mesh& mesh,
+    const std::vector<std::vector<gpf::HalfedgeId>>& projected_polyline_paths,
+    const PolylinePolygonSides& polyline_polygon_sides)
+{
+    std::vector<bool> is_polygon_boundary(mesh.n_halfedges_capacity(), false);
+    // Polygon paths may traverse both directions of the same mesh edge when
+    // that edge is internal to the polygon region. Cancel those twin pairs so
+    // flood fill can cross them instead of treating them as region boundaries.
+    for (const auto& halfedges : projected_polyline_paths) {
+        for (const auto hid : halfedges) {
+            auto twin_hid = mesh.he_twin(hid);
+            if (is_polygon_boundary[twin_hid.idx]) {
+                is_polygon_boundary[twin_hid.idx] = false;
+            } else {
+                is_polygon_boundary[hid.idx] = true;
+            }
+        }
+    }
+
+    // After cancellation, remaining halfedges are true polygon boundaries.
+    // The oriented halfedge sees the left polygon on its face and the right
+    // polygon on its twin face.
+    for (std::size_t path_idx = 0; path_idx < projected_polyline_paths.size(); ++path_idx) {
+        const auto [left_polygon_id, right_polygon_id] = polyline_polygon_sides[path_idx];
+        for (const auto hid : projected_polyline_paths[path_idx]) {
+            if (!is_polygon_boundary[hid.idx]) {
+                continue;
+            }
+            const auto twin_hid = mesh.he_twin(hid);
+            is_polygon_boundary[twin_hid.idx] = true;
+            set_face_polygon_id(mesh, mesh.he_face(hid), left_polygon_id);
+            set_face_polygon_id(mesh, mesh.he_face(twin_hid), right_polygon_id);
+        }
+    }
+
+    std::vector<gpf::FaceId> pending_faces;
+    pending_faces.reserve(mesh.n_faces());
+    for (const auto face : mesh.faces()) {
+        if (face.prop().polygon_id != gpf::kInvalidIndex) {
+            pending_faces.push_back(face.id);
+        }
+    }
+
+    while (!pending_faces.empty()) {
+        const auto fid = pending_faces.back();
+        pending_faces.pop_back();
+        const auto polygon_id = mesh.face_prop(fid).polygon_id;
+
+        for (const auto halfedge : mesh.face(fid).halfedges()) {
+            if (is_polygon_boundary[halfedge.id.idx]) {
+                continue;
+            }
+
+            const auto adjacent_fid = halfedge.twin().face().id;
+            if (!adjacent_fid.valid()) {
+                continue;
+            }
+
+            auto& adjacent_polygon_id = mesh.face_prop(adjacent_fid).polygon_id;
+            if (adjacent_polygon_id == gpf::kInvalidIndex) {
+                adjacent_polygon_id = polygon_id;
+                pending_faces.push_back(adjacent_fid);
+            } else if (adjacent_polygon_id != polygon_id) {
+                throw std::runtime_error("conflicting UV face polygon ids");
+            }
+        }
+    }
+}
+
+std::array<int, 3> polygon_color(const std::size_t polygon_id)
+{
+    static constexpr std::array<std::array<int, 3>, 12> kColors { {
+        { 230, 25, 75 },
+        { 60, 180, 75 },
+        { 0, 130, 200 },
+        { 245, 130, 48 },
+        { 145, 30, 180 },
+        { 70, 240, 240 },
+        { 240, 50, 230 },
+        { 210, 245, 60 },
+        { 250, 190, 190 },
+        { 0, 128, 128 },
+        { 230, 190, 255 },
+        { 170, 110, 40 },
+    } };
+
+    if (polygon_id == gpf::kInvalidIndex) {
+        return { 180, 180, 180 };
+    }
+    return kColors[polygon_id % kColors.size()];
+}
+
+void write_uv_mesh_as_off(const uv::Mesh& mesh, const std::string& path)
 {
     std::ofstream file(path);
     if (!file) {
-        throw std::runtime_error("failed to open UV mesh OBJ output file");
+        throw std::runtime_error("failed to open UV mesh OFF output file");
     }
 
     std::vector<std::size_t> vertex_indices(mesh.n_vertices_capacity(), gpf::kInvalidIndex);
-    std::size_t obj_vertex_idx = 1;
+    std::vector<gpf::VertexId> vertices;
+    vertices.reserve(mesh.n_vertices());
     for (auto vertex : mesh.vertices()) {
-        vertex_indices[vertex.id.idx] = obj_vertex_idx++;
-        const auto& pt = vertex.prop().pt;
-        file << "v " << pt[0] << ' ' << pt[1] << " 0\n";
+        vertex_indices[vertex.id.idx] = vertices.size();
+        vertices.push_back(vertex.id);
+    }
+
+    file << "OFF\n";
+    file << vertices.size() << ' ' << mesh.n_faces() << " 0\n";
+    for (const auto vid : vertices) {
+        const auto& pt = mesh.vertex_prop(vid).pt;
+        file << pt[0] << ' ' << pt[1] << " 0\n";
     }
 
     for (auto face : mesh.faces()) {
-        file << 'f';
+        std::vector<std::size_t> face_vertices;
         for (auto halfedge : face.halfedges()) {
             const auto vertex_idx = vertex_indices[halfedge.from().id.idx];
             if (vertex_idx == gpf::kInvalidIndex) {
                 throw std::runtime_error("face references invalid UV mesh vertex");
             }
-            file << ' ' << vertex_idx;
+            face_vertices.push_back(vertex_idx);
         }
+
+        file << face_vertices.size();
+        for (const auto vid : face_vertices) {
+            file << ' ' << vid;
+        }
+        const auto color = polygon_color(face.prop().polygon_id);
+        file << ' ' << color[0] << ' ' << color[1] << ' ' << color[2] << " 255";
         file << '\n';
     }
 }
@@ -756,12 +881,12 @@ void fit_polygon_on_surface(
     const auto [start_pt, xaxis, yaxis] = compute_anchor_uv_frame(fs.uv, corner_indices, anchor_idx);
     auto poly_uv_pts = map_polygon_to_uv_frame(polygon_points, start_pt, xaxis, yaxis);
     const auto [oriented_polylines, polyline_polygon_sides] = divide_polygons_into_oriented_polylines(polygons);
-    (void)polyline_polygon_sides;
     auto base_uv_edges = make_base_uv_edges(mesh, uv_mesh, local_to_mesh_vertex);
     std::unordered_map<gpf::FaceId, gpf::FaceId> uv_face_parent_map;
     std::unordered_map<gpf::EdgeId, gpf::EdgeId> uv_edge_parent_map;
-    gpf::project_polylines_on_mesh(poly_uv_pts, oriented_polylines, uv_mesh, &uv_face_parent_map, &uv_edge_parent_map);
-    write_uv_mesh_as_obj(uv_mesh, "fit_polygon_on_surface_projected_uv_mesh.obj");
+    auto projected_polyline_paths = std::get<1>(gpf::project_polylines_on_mesh(poly_uv_pts, oriented_polylines, uv_mesh, &uv_face_parent_map, &uv_edge_parent_map));
+    label_uv_mesh_polygon_ids(uv_mesh, projected_polyline_paths, polyline_polygon_sides);
+    write_uv_mesh_as_off(uv_mesh, "fit_polygon_on_surface_projected_uv_mesh.off");
     map_subdivided_uv_mesh_to_surface(
         mesh,
         uv_mesh,
