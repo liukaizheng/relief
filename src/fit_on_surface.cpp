@@ -31,6 +31,8 @@ namespace ranges = std::ranges;
 namespace views = std::views;
 
 namespace {
+std::array<int, 3> polygon_color(std::size_t polygon_id);
+
 void write_faces_as_off(const fit_on_surface::Mesh& mesh, const std::span<const gpf::FaceId> face_ids, const std::string& path)
 {
     std::vector<gpf::VertexId> vertices;
@@ -109,6 +111,8 @@ void write_mesh_as_off(const fit_on_surface::Mesh& mesh, const std::string& path
         for (const auto vid : face_vertices) {
             file << ' ' << vid;
         }
+        const auto color = polygon_color(face.prop().polygon_id);
+        file << ' ' << color[0] << ' ' << color[1] << ' ' << color[2] << " 255";
         file << '\n';
     }
 }
@@ -330,12 +334,7 @@ namespace uv {
         std::array<double, 2> pt;
     };
 
-    struct FaceProp {
-        gpf::FaceId parent;
-        std::size_t polygon_id = gpf::kInvalidIndex;
-    };
-
-    using Mesh = gpf::ManifoldMesh<VertexProp, gpf::Empty, gpf::Empty, FaceProp>;
+    using Mesh = gpf::ManifoldMesh<VertexProp, gpf::Empty, gpf::Empty, fit_on_surface::FaceProp>;
 }
 
 void set_face_polygon_id(uv::Mesh& mesh, const gpf::FaceId fid, const std::size_t polygon_id)
@@ -685,6 +684,7 @@ void map_subdivided_uv_mesh_to_surface(
     apply_edge_split_requests(mesh, edge_requests, local_to_mesh_vertex);
 
     std::vector<std::vector<gpf::VertexId>> replacement_triangles(inner_faces.size());
+    std::vector<std::vector<gpf::FaceId>> replacement_uv_faces(inner_faces.size());
     for (const auto face : uv_mesh.faces()) {
         const auto parent_iter = uv_face_parent_map.find(face.id);
         const auto root = parent_iter != uv_face_parent_map.end() ? parent_iter->second : face.id;
@@ -693,14 +693,26 @@ void map_subdivided_uv_mesh_to_surface(
             triangle_vertices[idx] = local_to_mesh_vertex[he.from().id.idx];
         }
         replacement_triangles[root.idx].append_range(std::move(triangle_vertices));
+        replacement_uv_faces[root.idx].push_back(face.id);
     }
 
     for (std::size_t face_idx = 0; face_idx < inner_faces.size(); ++face_idx) {
         auto& triangles = replacement_triangles[face_idx];
-        if (triangles.size() == std::size_t { 3 }) {
+        const auto& uv_faces = replacement_uv_faces[face_idx];
+        assert(triangles.size() == uv_faces.size() * std::size_t { 3 });
+        if (triangles.empty()) {
             continue;
         }
+        if (triangles.size() == std::size_t { 3 }) {
+            mesh.face_prop(inner_faces[face_idx]) = uv_mesh.face_prop(uv_faces.front());
+            continue;
+        }
+        const auto n_faces_before = mesh.n_faces_capacity();
         mesh.split_face_into_triangles(inner_faces[face_idx], triangles);
+        mesh.face_prop(inner_faces[face_idx]) = uv_mesh.face_prop(uv_faces.front());
+        for (std::size_t uv_face_idx = 1; uv_face_idx < uv_faces.size(); ++uv_face_idx) {
+            mesh.face_prop(gpf::FaceId { n_faces_before + uv_face_idx - 1 }) = uv_mesh.face_prop(uv_faces[uv_face_idx]);
+        }
     }
 }
 

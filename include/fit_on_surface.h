@@ -16,6 +16,7 @@ struct VertexProp {
 
 struct FaceProp {
     gpf::FaceId parent;
+    std::size_t polygon_id = gpf::kInvalidIndex;
 };
 
 using Mesh = gpf::ManifoldMesh<VertexProp, gpf::Empty, gpf::Empty, FaceProp>;
