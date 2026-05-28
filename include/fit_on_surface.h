@@ -14,15 +14,11 @@ struct VertexProp {
     std::array<double, 3> pt;
 };
 
-struct EdgeProp {
-    double len{0.0};
-};
-
 struct FaceProp {
     gpf::FaceId parent;
 };
 
-using Mesh = gpf::ManifoldMesh<VertexProp, gpf::Empty, EdgeProp, FaceProp>;
+using Mesh = gpf::ManifoldMesh<VertexProp, gpf::Empty, gpf::Empty, FaceProp>;
 }
 
 void fit_polygon_on_surface(

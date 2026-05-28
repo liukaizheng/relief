@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <gpf/ids.hpp>
 #include <gpf/mesh_flood_fill.hpp>
 #include <gpf/project_polylines_on_mesh.hpp>
 
@@ -65,6 +66,45 @@ void write_faces_as_off(const fit_on_surface::Mesh& mesh, const std::span<const 
         file << pt[0] << ' ' << pt[1] << ' ' << pt[2] << '\n';
     }
     for (const auto& face_vertices : faces) {
+        file << face_vertices.size();
+        for (const auto vid : face_vertices) {
+            file << ' ' << vid;
+        }
+        file << '\n';
+    }
+}
+
+void write_mesh_as_off(const fit_on_surface::Mesh& mesh, const std::string& path)
+{
+    std::vector<std::size_t> vertex_indices(mesh.n_vertices_capacity(), gpf::kInvalidIndex);
+    std::vector<gpf::VertexId> vertices;
+    vertices.reserve(mesh.n_vertices());
+    for (const auto vertex : mesh.vertices()) {
+        vertex_indices[vertex.id.idx] = vertices.size();
+        vertices.push_back(vertex.id);
+    }
+
+    std::ofstream file(path);
+    if (!file) {
+        throw std::runtime_error("failed to open mesh OFF output file");
+    }
+
+    file << "OFF\n";
+    file << vertices.size() << ' ' << mesh.n_faces() << " 0\n";
+    for (const auto vid : vertices) {
+        const auto& pt = mesh.vertex_prop(vid).pt;
+        file << pt[0] << ' ' << pt[1] << ' ' << pt[2] << '\n';
+    }
+    for (const auto face : mesh.faces()) {
+        std::vector<std::size_t> face_vertices;
+        for (const auto halfedge : face.halfedges()) {
+            const auto index = vertex_indices[halfedge.from().id.idx];
+            if (index == gpf::kInvalidIndex) {
+                throw std::runtime_error("face references invalid mesh vertex");
+            }
+            face_vertices.push_back(index);
+        }
+
         file << face_vertices.size();
         for (const auto vid : face_vertices) {
             file << ' ' << vid;
@@ -143,30 +183,31 @@ auto extract_face_mesh(
             v_data += 3;
         }
     }
-    return std::make_tuple(n_boundary_vertices, std::move(vertex_map), std::move(face_vertices), std::move(V), std::move(F));
+    return std::make_tuple(n_boundary_vertices, std::move(vertex_map), std::move(vertices), std::move(face_vertices), std::move(V), std::move(F));
 }
 
-inline auto face_point(const auto& mesh, const gpf::FaceId fid, const std::span<const double, 3> bary_coords) {
+inline auto face_point(const auto& mesh, const gpf::FaceId fid, const std::span<const double, 3> bary_coords)
+{
     auto he = mesh.face(fid).halfedge();
     auto pa = Eigen::Vector3d::Map(he.from().prop().pt.data());
     he = he.next();
     auto pb = Eigen::Vector3d::Map(he.from().prop().pt.data());
     auto pc = Eigen::Vector3d::Map(he.to().prop().pt.data());
-    std::array<double, 3> result{};
+    std::array<double, 3> result {};
     Eigen::Vector3d::Map(result.data()) = pa * bary_coords[0] + pb * bary_coords[1] + pc * bary_coords[2];
     return result;
 }
 
-inline std::size_t find_anchor_corner_index(const VMat2& uv, const std::span<const std::size_t> vertices) {
+inline std::size_t find_anchor_corner_index(const VMat2& uv, const std::span<const std::size_t> vertices)
+{
     Eigen::Vector2d center = uv.row(vertices[0]).transpose();
-    return ranges::min(views::zip(vertices.subspan(1), ranges::iota_view{std::size_t{1}, std::size_t{5}}) |
-        views::transform([&uv, &center](auto&& pair) { return std::make_pair(
-            (uv.row(std::get<0>(pair)).transpose() - center).squaredNorm(),
-            std::get<1>(pair)
-        ); }), {}, &std::pair<double, std::size_t>::first).second;
+    return ranges::min(views::zip(vertices.subspan(1), ranges::iota_view { std::size_t { 1 }, std::size_t { 5 } }) | views::transform([&uv, &center](auto&& pair) { return std::make_pair(
+                                                                                                                                                                        (uv.row(std::get<0>(pair)).transpose() - center).squaredNorm(),
+                                                                                                                                                                        std::get<1>(pair)); }), {}, &std::pair<double, std::size_t>::first).second;
 }
 
-bool boundary_contains_anchor_rectangle(const VMat2& uv, const std::span<const std::size_t> vertices, const std::size_t min_idx, const std::size_t n_boundaries) {
+bool boundary_contains_anchor_rectangle(const VMat2& uv, const std::span<const std::size_t> vertices, const std::size_t min_idx, const std::size_t n_boundaries)
+{
     Eigen::Vector2d center = uv.row(vertices[0]).transpose();
     Eigen::Vector2d base_dir = uv.row(vertices[min_idx]).transpose() - center;
     auto half_diag_len = base_dir.norm();
@@ -176,7 +217,7 @@ bool boundary_contains_anchor_rectangle(const VMat2& uv, const std::span<const s
         auto actual_len = v.norm();
         v /= actual_len;
         auto angle_vec = gpf::detail::complex_div(v, base_dir);
-        auto expected_len = half_diag_len * std::abs(angle_vec[0]);  // cos(\theta) = angle_vec[0]
+        auto expected_len = half_diag_len * std::abs(angle_vec[0]); // cos(\theta) = angle_vec[0]
         if (actual_len < expected_len) {
             return false;
         }
@@ -184,7 +225,8 @@ bool boundary_contains_anchor_rectangle(const VMat2& uv, const std::span<const s
     return true;
 }
 
-auto compute_anchor_uv_frame(const VMat2& uv, const std::span<const std::size_t> vertices, const std::size_t min_idx) {
+auto compute_anchor_uv_frame(const VMat2& uv, const std::span<const std::size_t> vertices, const std::size_t min_idx)
+{
     Eigen::Vector2d center = uv.row(vertices[0]).transpose();
     Eigen::Vector2d base_dir = uv.row(vertices[min_idx]).transpose() - center;
     const auto angle = std::numbers::pi * (1.0 - 0.5 * min_idx); // rotate counterclockwise -0.5 * i * pi, then reverse
@@ -198,7 +240,8 @@ auto compute_anchor_uv_frame(const VMat2& uv, const std::span<const std::size_t>
     return std::make_tuple(std::move(start_pt), std::move(xaxis), std::move(yaxis));
 }
 
-auto map_polygon_to_uv_frame(const std::vector<std::array<double, 2>>& polygon_points, const Eigen::Vector2d& start_pt, const Eigen::Vector2d& xaxis, const Eigen::Vector2d& yaxis) {
+auto map_polygon_to_uv_frame(const std::vector<std::array<double, 2>>& polygon_points, const Eigen::Vector2d& start_pt, const Eigen::Vector2d& xaxis, const Eigen::Vector2d& yaxis)
+{
     return polygon_points | views::transform([&start_pt, &xaxis, &yaxis](auto&& point) {
         std::array<double, 2> result;
         Eigen::Vector2d::Map(result.data()) = start_pt + xaxis * point[0] + yaxis * point[1];
@@ -283,11 +326,11 @@ void add_oriented_polyline(
 }
 
 namespace uv {
-struct VertexProp {
-    std::array<double, 2> pt;
-};
+    struct VertexProp {
+        std::array<double, 2> pt;
+    };
 
-using Mesh = gpf::ManifoldMesh<VertexProp, gpf::Empty, gpf::Empty, fit_on_surface::FaceProp>;
+    using Mesh = gpf::ManifoldMesh<VertexProp, gpf::Empty, gpf::Empty, fit_on_surface::FaceProp>;
 }
 
 void write_uv_mesh_as_obj(const uv::Mesh& mesh, const std::string& path)
@@ -315,6 +358,224 @@ void write_uv_mesh_as_obj(const uv::Mesh& mesh, const std::string& path)
             file << ' ' << vertex_idx;
         }
         file << '\n';
+    }
+}
+
+struct EdgeSplitRequest {
+    gpf::VertexId uv_vertex;
+    double t;
+    std::array<double, 3> point;
+};
+
+std::unordered_map<gpf::EdgeId, gpf::EdgeId> make_base_uv_edges(
+    const fit_on_surface::Mesh& mesh,
+    const uv::Mesh& uv_mesh,
+    const std::vector<gpf::VertexId>& local_to_mesh_vertex)
+{
+    std::unordered_map<gpf::EdgeId, gpf::EdgeId> base_edges;
+    base_edges.reserve(uv_mesh.n_edges());
+    for (const auto edge : uv_mesh.edges()) {
+        const auto [uv_va, uv_vb] = edge.vertices();
+
+        const auto mesh_edge = mesh.e_from_vertices(local_to_mesh_vertex[uv_va.id.idx], local_to_mesh_vertex[uv_vb.id.idx]);
+        base_edges.emplace(edge.id, mesh_edge);
+    }
+    return base_edges;
+}
+
+std::vector<gpf::VertexId> make_mesh_to_local_uv_vertex_map(
+    const fit_on_surface::Mesh& mesh,
+    const std::vector<gpf::VertexId>& local_to_mesh_vertex)
+{
+    std::vector<gpf::VertexId> mesh_to_local_uv_vertex(mesh.n_vertices_capacity(), gpf::VertexId {});
+    for (std::size_t local_idx = 0; local_idx < local_to_mesh_vertex.size(); ++local_idx) {
+        mesh_to_local_uv_vertex[local_to_mesh_vertex[local_idx].idx] = gpf::VertexId { local_idx };
+    }
+    return mesh_to_local_uv_vertex;
+}
+
+std::unordered_map<gpf::EdgeId, std::vector<EdgeSplitRequest>> collect_edge_split_requests(
+    const fit_on_surface::Mesh& mesh,
+    const uv::Mesh& uv_mesh,
+    const std::vector<gpf::VertexId>& mesh_to_local_uv_vertex,
+    const std::unordered_map<gpf::EdgeId, std::vector<gpf::EdgeId>>& subedges_by_parent,
+    const std::unordered_map<gpf::EdgeId, gpf::EdgeId>& base_uv_edges,
+    std::vector<gpf::VertexId>& local_to_mesh_vertex)
+{
+    std::unordered_map<gpf::EdgeId, std::vector<EdgeSplitRequest>> edge_requests;
+    for (const auto& [base_edge_id, subedges] : subedges_by_parent) {
+        const auto mesh_eid = base_uv_edges.at(base_edge_id);
+        const auto [va, vb] = mesh.e_vertices(mesh_eid);
+        const auto base_uv_va = mesh_to_local_uv_vertex[va.idx];
+        const auto base_uv_vb = mesh_to_local_uv_vertex[vb.idx];
+
+        auto uv_pa = Eigen::Vector2d::Map(uv_mesh.vertex_prop(base_uv_va).pt.data());
+        auto uv_pb = Eigen::Vector2d::Map(uv_mesh.vertex_prop(base_uv_vb).pt.data());
+        auto pa = Eigen::Vector3d::Map(mesh.vertex_prop(va).pt.data());
+        auto pb = Eigen::Vector3d::Map(mesh.vertex_prop(vb).pt.data());
+
+        Eigen::Vector2d edge_vec = uv_pb - uv_pa;
+        const double edge_len_sq = edge_vec.squaredNorm();
+
+        for (const auto subedge_id : subedges) {
+            for (const auto uv_vertex : uv_mesh.edge(subedge_id).vertices()) {
+                if (local_to_mesh_vertex[uv_vertex.id.idx].valid()) {
+                    continue;
+                }
+
+                local_to_mesh_vertex[uv_vertex.id.idx] = gpf::VertexId { 0 };
+                const double t = std::min(std::max((Eigen::Vector2d::Map(uv_vertex.prop().pt.data()) - uv_pa).dot(edge_vec) / edge_len_sq, 0.0), 1.0);
+                std::array<double, 3> point {};
+                Eigen::Vector3d::Map(point.data()) = pa * (1.0 - t) + t * pb;
+                edge_requests[mesh_eid].push_back(EdgeSplitRequest {
+                    .uv_vertex = uv_vertex.id,
+                    .t = t,
+                    .point = std::move(point),
+                });
+            }
+        }
+    }
+    return edge_requests;
+}
+
+void apply_edge_split_requests(
+    fit_on_surface::Mesh& mesh,
+    std::unordered_map<gpf::EdgeId, std::vector<EdgeSplitRequest>>& edge_requests,
+    std::vector<gpf::VertexId>& uv_to_mesh_vertex)
+{
+    for (auto& [eid, requests] : edge_requests) {
+        if (requests.empty()) {
+            continue;
+        }
+
+        ranges::sort(requests, {}, &EdgeSplitRequest::t);
+
+        gpf::EdgeId current_eid = eid;
+
+        for (const auto& request : requests) {
+            const auto new_vertex = mesh.split_edge(current_eid);
+            mesh.vertex_prop(new_vertex).pt = request.point;
+            uv_to_mesh_vertex[request.uv_vertex.idx] = new_vertex;
+            current_eid = mesh.vertex(new_vertex).halfedge().edge().id;
+        }
+    }
+}
+
+void add_face_inner_vertices(
+    fit_on_surface::Mesh& mesh,
+    const uv::Mesh& uv_mesh,
+    const std::size_t n_old_vertices,
+    const std::span<const gpf::FaceId> inner_faces,
+    const std::vector<gpf::FaceId>& uv_vertex_root_face,
+    const std::vector<gpf::VertexId>& mesh_to_local_uv_vertex,
+    std::vector<gpf::VertexId>& local_to_mesh_vertex)
+{
+    std::unordered_map<gpf::FaceId, std::vector<gpf::VertexId>> face_inner_vertices;
+    for (std::size_t idx { n_old_vertices }; idx < uv_mesh.n_vertices_capacity(); idx++) {
+        const gpf::VertexId vid { idx };
+        if (local_to_mesh_vertex[idx].valid()) {
+            continue;
+        }
+
+        const auto root = uv_vertex_root_face[idx];
+        face_inner_vertices[root].push_back(vid);
+    }
+    for (const auto& [fid, vertices] : face_inner_vertices) {
+        std::vector<double> local_points;
+        local_points.reserve((3 + vertices.size()) * 2);
+        std::array<gpf::VertexId, 3> triangle_vertices;
+        for (const auto [idx, he] : views::zip(ranges::iota_view { std::size_t { 0 }, std::size_t { 3 } }, mesh.face(inner_faces[fid.idx]).halfedges())) {
+            triangle_vertices[idx] = he.from().id;
+        }
+        for (const auto vid : triangle_vertices) {
+            assert(mesh_to_local_uv_vertex[vid.idx].valid());
+            local_points.append_range(uv_mesh.vertex_prop(mesh_to_local_uv_vertex[vid.idx]).pt);
+        }
+        for (const auto vid : vertices) {
+            local_points.append_range(uv_mesh.vertex_prop(vid).pt);
+        }
+
+        auto bary_coords = gpf::detail::compute_bary_coordinates(local_points);
+        Eigen::Vector3d pa = Eigen::Vector3d::Map(mesh.vertex_prop(triangle_vertices[0]).pt.data());
+        Eigen::Vector3d pb = Eigen::Vector3d::Map(mesh.vertex_prop(triangle_vertices[1]).pt.data());
+        Eigen::Vector3d pc = Eigen::Vector3d::Map(mesh.vertex_prop(triangle_vertices[2]).pt.data());
+        auto new_vid = mesh.new_vertices(vertices.size());
+        for (std::size_t i = 0; i < vertices.size(); ++i) {
+            std::span<double, 3> bary { bary_coords.data() + i * 3, 3 };
+            gpf::detail::normalize_barycentric(bary, gpf::detail::BARY_EPS);
+            Eigen::Vector3d::Map(mesh.vertex_prop(new_vid).pt.data()) = bary[0] * pa + bary[1] * pb + bary[2] * pc;
+            local_to_mesh_vertex[vertices[i].idx] = new_vid;
+            new_vid.idx += 1;
+        }
+    }
+}
+
+void map_subdivided_uv_mesh_to_surface(
+    fit_on_surface::Mesh& mesh,
+    const uv::Mesh& uv_mesh,
+    std::vector<gpf::VertexId>& local_to_mesh_vertex,
+    const std::span<const gpf::FaceId> inner_faces,
+    const std::span<const std::size_t> inner_face_indices,
+    const std::unordered_map<gpf::FaceId, gpf::FaceId>& uv_face_parent_map,
+    const std::unordered_map<gpf::EdgeId, gpf::EdgeId>& uv_edge_parent_map,
+    const std::unordered_map<gpf::EdgeId, gpf::EdgeId>& base_uv_edges)
+{
+    const auto n_old_vertices = local_to_mesh_vertex.size();
+    std::unordered_map<gpf::EdgeId, std::vector<gpf::EdgeId>> subedges_by_parent;
+    {
+        for (const auto [child, parent] : uv_edge_parent_map) {
+            subedges_by_parent[parent].push_back(child);
+        }
+    }
+    const auto mesh_to_local_uv_vertex = make_mesh_to_local_uv_vertex_map(mesh, local_to_mesh_vertex);
+    local_to_mesh_vertex.resize(uv_mesh.n_vertices_capacity());
+    auto edge_requests = collect_edge_split_requests(
+        mesh,
+        uv_mesh,
+        mesh_to_local_uv_vertex,
+        subedges_by_parent,
+        base_uv_edges,
+        local_to_mesh_vertex);
+
+    std::vector<gpf::FaceId> uv_vertex_root_face(uv_mesh.n_vertices_capacity());
+    for (const auto face : uv_mesh.faces()) {
+        const auto parent_iter = uv_face_parent_map.find(face.id);
+        const auto root = parent_iter != uv_face_parent_map.end() ? parent_iter->second : face.id;
+        for (const auto halfedge : face.halfedges()) {
+            auto& incident_root = uv_vertex_root_face[halfedge.from().id.idx];
+            if (!incident_root.valid()) {
+                incident_root = root;
+            }
+        }
+    }
+
+    add_face_inner_vertices(
+        mesh,
+        uv_mesh,
+        n_old_vertices,
+        inner_faces,
+        uv_vertex_root_face,
+        mesh_to_local_uv_vertex,
+        local_to_mesh_vertex);
+    apply_edge_split_requests(mesh, edge_requests, local_to_mesh_vertex);
+
+    std::vector<std::vector<gpf::VertexId>> replacement_triangles(inner_faces.size());
+    for (const auto face : uv_mesh.faces()) {
+        const auto parent_iter = uv_face_parent_map.find(face.id);
+        const auto root = parent_iter != uv_face_parent_map.end() ? parent_iter->second : face.id;
+        std::array<gpf::VertexId, 3> triangle_vertices;
+        for (auto [idx, he] : views::zip(ranges::iota_view { std::size_t { 0 }, std::size_t { 3 } }, face.halfedges())) {
+            triangle_vertices[idx] = local_to_mesh_vertex[he.from().id.idx];
+        }
+        replacement_triangles[root.idx].append_range(std::move(triangle_vertices));
+    }
+
+    for (std::size_t face_idx = 0; face_idx < inner_faces.size(); ++face_idx) {
+        auto& triangles = replacement_triangles[face_idx];
+        if (triangles.size() == std::size_t { 3 }) {
+            continue;
+        }
+        mesh.split_face_into_triangles(inner_faces[face_idx], triangles);
     }
 }
 
@@ -441,7 +702,7 @@ void fit_polygon_on_surface(
         std::vector<std::vector<std::size_t>> { { 0, 1, 2, 3, 0 } },
         mesh);
     auto inner_faces = gpf::surround_faces_by_halfedges(mesh, boundary_paths.front());
-    auto [n_boundary_vertices, vertex_map, inner_face_indices, V, F] = extract_face_mesh(mesh, boundary_paths.front(), inner_faces);
+    auto [n_boundary_vertices, vertex_map, local_to_mesh_vertex, inner_face_indices, V, F] = extract_face_mesh(mesh, boundary_paths.front(), inner_faces);
     const auto bnd = Eigen::VectorXi::LinSpaced(
         static_cast<Eigen::Index>(n_boundary_vertices),
         0,
@@ -471,7 +732,7 @@ void fit_polygon_on_surface(
     write_uv_as_off(fs.uv, fs.F, "fit_polygon_on_surface_uv.off");
     write_faces_as_off(mesh, inner_faces, "fit_polygon_on_surface.off");
 
-    const std::vector<std::size_t> corner_indices = std::span<const gpf::VertexId>{project_vertices.data() + project_vertices.size() - 5, 5} | views::transform([&vertex_map](auto vid) { return vertex_map[vid.idx]; }) | ranges::to<std::vector>();
+    const std::vector<std::size_t> corner_indices = std::span<const gpf::VertexId> { project_vertices.data() + project_vertices.size() - 5, 5 } | views::transform([&vertex_map](auto vid) { return vertex_map[vid.idx]; }) | ranges::to<std::vector>();
     if (ranges::any_of(corner_indices, [](auto idx) { return idx == gpf::kInvalidIndex; })) {
         throw std::runtime_error("Invalid vertex index in corner_indices");
     }
@@ -481,10 +742,10 @@ void fit_polygon_on_surface(
         throw std::runtime_error("Failed to fit polygon on surface");
     }
 
-    auto uv_mesh = uv::Mesh::new_in(ranges::iota_view{std::size_t{0}, inner_faces.size()} | views::transform([&inner_face_indices](auto idx) { return  std::span<const std::size_t, 3>{inner_face_indices.data() + idx * 3, 3}; }));
+    auto uv_mesh = uv::Mesh::new_in(ranges::iota_view { std::size_t { 0 }, inner_faces.size() } | views::transform([&inner_face_indices](auto idx) { return std::span<const std::size_t, 3> { inner_face_indices.data() + idx * 3, 3 }; }));
     for (auto v : uv_mesh.vertices()) {
         auto row = fs.uv.row(static_cast<Eigen::Index>(v.id.idx));
-        v.prop().pt = {row(0), row(1)};
+        v.prop().pt = { row(0), row(1) };
     }
 
     for (auto face : uv_mesh.faces()) {
@@ -494,9 +755,21 @@ void fit_polygon_on_surface(
 
     const auto [start_pt, xaxis, yaxis] = compute_anchor_uv_frame(fs.uv, corner_indices, anchor_idx);
     auto poly_uv_pts = map_polygon_to_uv_frame(polygon_points, start_pt, xaxis, yaxis);
-    const auto [oriented_polylines, polyline_polygon_sides] =
-        divide_polygons_into_oriented_polylines(polygons);
+    const auto [oriented_polylines, polyline_polygon_sides] = divide_polygons_into_oriented_polylines(polygons);
     (void)polyline_polygon_sides;
-    gpf::project_polylines_on_mesh(poly_uv_pts, oriented_polylines, uv_mesh);
+    auto base_uv_edges = make_base_uv_edges(mesh, uv_mesh, local_to_mesh_vertex);
+    std::unordered_map<gpf::FaceId, gpf::FaceId> uv_face_parent_map;
+    std::unordered_map<gpf::EdgeId, gpf::EdgeId> uv_edge_parent_map;
+    gpf::project_polylines_on_mesh(poly_uv_pts, oriented_polylines, uv_mesh, &uv_face_parent_map, &uv_edge_parent_map);
     write_uv_mesh_as_obj(uv_mesh, "fit_polygon_on_surface_projected_uv_mesh.obj");
+    map_subdivided_uv_mesh_to_surface(
+        mesh,
+        uv_mesh,
+        local_to_mesh_vertex,
+        inner_faces,
+        inner_face_indices,
+        uv_face_parent_map,
+        uv_edge_parent_map,
+        base_uv_edges);
+    write_mesh_as_off(mesh, "fit_polygon_on_surface_final.off");
 }
