@@ -491,18 +491,18 @@ struct EdgeSplitRequest {
     std::array<double, 3> point;
 };
 
-std::unordered_map<gpf::EdgeId, gpf::EdgeId> make_base_uv_edges(
+auto make_base_uv_edges(
     const fit_on_surface::Mesh& mesh,
     const uv::Mesh& uv_mesh,
     const std::vector<gpf::VertexId>& local_to_mesh_vertex)
 {
-    std::unordered_map<gpf::EdgeId, gpf::EdgeId> base_edges;
+    std::vector<gpf::EdgeId> base_edges(mesh.n_edges_capacity());
     base_edges.reserve(uv_mesh.n_edges());
     for (const auto edge : uv_mesh.edges()) {
         const auto [uv_va, uv_vb] = edge.vertices();
 
         const auto mesh_edge = mesh.e_from_vertices(local_to_mesh_vertex[uv_va.id.idx], local_to_mesh_vertex[uv_vb.id.idx]);
-        base_edges.emplace(edge.id, mesh_edge);
+        base_edges[edge.id.idx] = mesh_edge;
     }
     return base_edges;
 }
@@ -523,12 +523,15 @@ std::unordered_map<gpf::EdgeId, std::vector<EdgeSplitRequest>> collect_edge_spli
     const uv::Mesh& uv_mesh,
     const std::vector<gpf::VertexId>& mesh_to_local_uv_vertex,
     const std::unordered_map<gpf::EdgeId, std::vector<gpf::EdgeId>>& subedges_by_parent,
-    const std::unordered_map<gpf::EdgeId, gpf::EdgeId>& base_uv_edges,
+    const std::vector<gpf::EdgeId>& base_uv_edges,
     std::vector<gpf::VertexId>& local_to_mesh_vertex)
 {
     std::unordered_map<gpf::EdgeId, std::vector<EdgeSplitRequest>> edge_requests;
     for (const auto& [base_edge_id, subedges] : subedges_by_parent) {
-        const auto mesh_eid = base_uv_edges.at(base_edge_id);
+        if (base_edge_id.idx >= base_uv_edges.size()) {
+            continue;
+        }
+        const auto mesh_eid = base_uv_edges[base_edge_id.idx];
         const auto [va, vb] = mesh.e_vertices(mesh_eid);
         const auto base_uv_va = mesh_to_local_uv_vertex[va.idx];
         const auto base_uv_vb = mesh_to_local_uv_vertex[vb.idx];
@@ -642,7 +645,7 @@ void map_subdivided_uv_mesh_to_surface(
     const std::span<const std::size_t> inner_face_indices,
     const std::unordered_map<gpf::FaceId, gpf::FaceId>& uv_face_parent_map,
     const std::unordered_map<gpf::EdgeId, gpf::EdgeId>& uv_edge_parent_map,
-    const std::unordered_map<gpf::EdgeId, gpf::EdgeId>& base_uv_edges)
+    const std::vector<gpf::EdgeId>& base_uv_edges)
 {
     const auto n_old_vertices = local_to_mesh_vertex.size();
     std::unordered_map<gpf::EdgeId, std::vector<gpf::EdgeId>> subedges_by_parent;
