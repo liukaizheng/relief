@@ -532,6 +532,9 @@ std::unordered_map<gpf::EdgeId, std::vector<EdgeSplitRequest>> collect_edge_spli
             continue;
         }
         const auto mesh_eid = base_uv_edges[base_edge_id.idx];
+        if (!mesh_eid.valid()) {
+            continue;
+        }
         const auto [va, vb] = mesh.e_vertices(mesh_eid);
         const auto base_uv_va = mesh_to_local_uv_vertex[va.idx];
         const auto base_uv_vb = mesh_to_local_uv_vertex[vb.idx];
