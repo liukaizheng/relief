@@ -210,29 +210,58 @@ inline std::size_t find_anchor_corner_index(const VMat2& uv, const std::span<con
                                                                                                                                                                         std::get<1>(pair)); }), {}, &std::pair<double, std::size_t>::first).second;
 }
 
-bool boundary_contains_anchor_rectangle(const VMat2& uv, const std::span<const std::size_t> vertices, const std::size_t min_idx, const std::size_t n_boundaries)
+std::optional<double> boundary_contains_anchor_rectangle(const VMat2& uv, const std::span<const std::size_t> vertices, const std::size_t min_idx, const Eigen::VectorXi& bnd)
 {
     Eigen::Vector2d center = uv.row(vertices[0]).transpose();
     Eigen::Vector2d base_dir = uv.row(vertices[min_idx]).transpose() - center;
     auto half_diag_len = base_dir.norm();
     base_dir /= half_diag_len;
-    for (std::size_t i = 0; i < n_boundaries; ++i) {
-        Eigen::Vector2d v = uv.row(i).transpose() - center;
-        auto actual_len = v.norm();
-        v /= actual_len;
-        auto angle_vec = gpf::detail::complex_div(v, base_dir);
+    std::optional<double> scale;
+    for (Eigen::Index i{0}; i < bnd.size(); ++i) {
+        Eigen::Vector2d va = uv.row(bnd(i)).transpose() - center;
+        Eigen::Vector2d vb = uv.row(bnd((i + 1) % bnd.size())).transpose() - center;
+        auto area = va.cross(vb);
+        if (area < 0.0) {
+            std::swap(va, vb);
+            area = -area;
+        }
+        Eigen::Vector2d vec{};
+        if (area == 0.0) {
+            vec = va.squaredNorm() < vb.squaredNorm() ? va : vb;
+        } else {
+            Eigen::Vector2d vba = va - vb;
+            if (vb.dot(vba) >= 0.0) {
+                vec = vb;
+            } else if (va.dot(vba) <= 0.0) {
+                vec = va;
+            } else {
+                auto len = vba.norm();
+                vba /= len;
+                auto h = area / len;
+                vec = Eigen::Vector2d{-vec[1] * h, vec[0] * h}; // rotate vba 90 degree counterclockwise
+            }
+        }
+        auto actual_len = vec.norm();
+        vec /= actual_len;
+        auto angle_vec = gpf::detail::complex_div(vec, base_dir);
         auto expected_len = half_diag_len * std::abs(angle_vec[0]); // cos(\theta) = angle_vec[0]
         if (actual_len < expected_len) {
-            return false;
+            const auto t = actual_len / expected_len;
+            if (!scale.has_value() || t < *scale) {
+                scale = t;
+            }
         }
     }
-    return true;
+    return scale;
 }
 
-auto compute_anchor_uv_frame(const VMat2& uv, const std::span<const std::size_t> vertices, const std::size_t min_idx)
+auto compute_anchor_uv_frame(const VMat2& uv, const std::span<const std::size_t> vertices, const std::size_t min_idx, const std::optional<double> scale)
 {
     Eigen::Vector2d center = uv.row(vertices[0]).transpose();
     Eigen::Vector2d base_dir = uv.row(vertices[min_idx]).transpose() - center;
+    if (scale.has_value()) {
+        base_dir *= *scale * 0.99;
+    }
     const auto angle = std::numbers::pi * (1.0 - 0.5 * min_idx); // rotate counterclockwise -0.5 * i * pi, then reverse
     Eigen::Rotation2Dd rot(angle);
     Eigen::Vector2d dir = rot * base_dir;
@@ -846,10 +875,20 @@ void fit_polygon_on_surface(
         mesh);
     auto inner_faces = gpf::surround_faces_by_halfedges(mesh, boundary_paths.front());
     auto [n_boundary_vertices, vertex_map, local_to_mesh_vertex, inner_face_indices, V, F] = extract_face_mesh(mesh, boundary_paths.front(), inner_faces);
-    const auto bnd = Eigen::VectorXi::LinSpaced(
-        static_cast<Eigen::Index>(n_boundary_vertices),
-        0,
-        static_cast<int>(n_boundary_vertices) - 1);
+    auto uv_mesh = uv::Mesh::new_in(ranges::iota_view { std::size_t { 0 }, inner_faces.size() } | views::transform([&inner_face_indices](auto idx) { return std::span<const std::size_t, 3> { inner_face_indices.data() + idx * 3, 3 }; }));
+    Eigen::VectorXi bnd(n_boundary_vertices);
+    {
+        auto curr_he = uv_mesh.vertex(gpf::VertexId{0}).halfedge().prev();
+        Eigen::Index idx{0};
+        const auto first_hid = curr_he.id;
+        while (true) {
+            bnd(idx++) = static_cast<int>(curr_he.to().id.idx);
+            curr_he = curr_he.prev();
+            if (curr_he.id == first_hid) {
+                break;
+            }
+        }
+    }
     // Eigen::MatrixXd bnd_uv, uv;
     Eigen::MatrixXd bnd_uv;
     VMat2 uv;
@@ -881,11 +920,8 @@ void fit_polygon_on_surface(
     }
 
     const auto anchor_idx = find_anchor_corner_index(fs.uv, corner_indices);
-    if (!boundary_contains_anchor_rectangle(fs.uv, corner_indices, anchor_idx, n_boundary_vertices)) {
-        throw std::runtime_error("Failed to fit polygon on surface");
-    }
+    const auto scale = boundary_contains_anchor_rectangle(fs.uv, corner_indices, anchor_idx, bnd);
 
-    auto uv_mesh = uv::Mesh::new_in(ranges::iota_view { std::size_t { 0 }, inner_faces.size() } | views::transform([&inner_face_indices](auto idx) { return std::span<const std::size_t, 3> { inner_face_indices.data() + idx * 3, 3 }; }));
     for (auto v : uv_mesh.vertices()) {
         auto row = fs.uv.row(static_cast<Eigen::Index>(v.id.idx));
         v.prop().pt = { row(0), row(1) };
@@ -896,7 +932,7 @@ void fit_polygon_on_surface(
         assert(face.prop().parent.valid());
     }
 
-    const auto [start_pt, xaxis, yaxis] = compute_anchor_uv_frame(fs.uv, corner_indices, anchor_idx);
+    const auto [start_pt, xaxis, yaxis] = compute_anchor_uv_frame(fs.uv, corner_indices, anchor_idx, scale);
     auto poly_uv_pts = map_polygon_to_uv_frame(polygon_points, start_pt, xaxis, yaxis);
     const auto [oriented_polylines, polyline_polygon_sides] = divide_polygons_into_oriented_polylines(polygons);
     auto base_uv_edges = make_base_uv_edges(mesh, uv_mesh, local_to_mesh_vertex);
