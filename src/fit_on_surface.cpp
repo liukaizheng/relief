@@ -19,6 +19,7 @@
 #include <map>
 #include <numbers>
 #include <optional>
+#include <predicates/predicates.hpp>
 #include <ranges>
 #include <span>
 #include <stdexcept>
@@ -210,45 +211,78 @@ inline std::size_t find_anchor_corner_index(const VMat2& uv, const std::span<con
                                                                                                                                                                         std::get<1>(pair)); }), {}, &std::pair<double, std::size_t>::first).second;
 }
 
-std::optional<double> boundary_contains_anchor_rectangle(const VMat2& uv, const std::span<const std::size_t> vertices, const std::size_t min_idx, const Eigen::VectorXi& bnd)
-{
+std::optional<double> boundary_contains_anchor_rectangle(const VMat2& uv, const std::span<const std::size_t> vertices, const std::size_t min_idx, const Eigen::VectorXi& bnd) {
+    const auto div = [](const auto& a, const auto& b) noexcept {
+        return Eigen::Vector2d{ a.x() * b.x() + a.y() * b.y(), a.y() * b.x() - a.x() * b.y() };
+    };
     Eigen::Vector2d center = uv.row(vertices[0]).transpose();
     Eigen::Vector2d base_dir = uv.row(vertices[min_idx]).transpose() - center;
-    auto half_diag_len = base_dir.norm();
+    std::vector<double> corners = {base_dir[0], base_dir[1], -base_dir[1], base_dir[0], -base_dir[0], -base_dir[1], base_dir[1], -base_dir[0]};
+    const auto half_diag_len = base_dir.norm();
     base_dir /= half_diag_len;
-    std::optional<double> scale;
-    for (Eigen::Index i{0}; i < bnd.size(); ++i) {
-        Eigen::Vector2d va = uv.row(bnd(i)).transpose() - center;
-        Eigen::Vector2d vb = uv.row(bnd((i + 1) % bnd.size())).transpose() - center;
-        auto area = va.cross(vb);
-        if (area < 0.0) {
-            std::swap(va, vb);
-            area = -area;
-        }
-        Eigen::Vector2d vec{};
-        if (area == 0.0) {
-            vec = va.squaredNorm() < vb.squaredNorm() ? va : vb;
+    const auto half_len = half_diag_len / std::numbers::sqrt2;
+    const Eigen::Rotation2Dd rot(std::numbers::pi * 0.25);
+    Eigen::Vector2d horizontal_dir = rot * base_dir;
+
+    VMat2 uv_diff = uv(bnd, Eigen::placeholders::all).rowwise() - center.transpose();
+    std::vector<std::size_t> quadrants(bnd.rows());
+    const auto compute_quadrant = [](const double* data) {
+        if (data[0] > 0.0 && data[1] >= 0.0) {
+            return 0;
+        } else if (data[0] <= 0.0 && data[1] > 0.0) {
+            return 1;
+        } else if (data[0] < 0.0 && data[1] <= 0.0) {
+            return 2;
         } else {
-            Eigen::Vector2d vba = va - vb;
-            if (vb.dot(vba) >= 0.0) {
-                vec = vb;
-            } else if (va.dot(vba) <= 0.0) {
-                vec = va;
-            } else {
-                auto len = vba.norm();
-                vba /= len;
-                auto h = area / len;
-                vec = Eigen::Vector2d{-vec[1] * h, vec[0] * h}; // rotate vba 90 degree counterclockwise
-            }
+            return 3;
         }
+    };
+    std::optional<double> scale{};
+    for (Eigen::Index i = 0; i < uv_diff.rows(); i++) {
+        Eigen::Vector2d vec = uv_diff.row(i).transpose();
         auto actual_len = vec.norm();
         vec /= actual_len;
-        auto angle_vec = gpf::detail::complex_div(vec, base_dir);
-        auto expected_len = half_diag_len * std::abs(angle_vec[0]); // cos(\theta) = angle_vec[0]
+        auto angle_vec = div(vec, horizontal_dir);
+        auto expected_len = half_len / std::max(std::abs(angle_vec[0]), std::abs(angle_vec[1]));
         if (actual_len < expected_len) {
             const auto t = actual_len / expected_len;
             if (!scale.has_value() || t < *scale) {
                 scale = t;
+            }
+        }
+
+        angle_vec = (rot * angle_vec).eval(); // rotate 45 degree counterclockwise
+        quadrants[i] = compute_quadrant(angle_vec.data());
+    }
+    Eigen::Vector2d zero{0.0, 0.0};
+    for (Eigen::Index i = 0; i < uv_diff.rows(); i++) {
+        const auto j = (i + 1) % uv_diff.rows();
+        Eigen::Vector2d va = uv_diff.row(i);
+        Eigen::Vector2d vb = uv_diff.row(j);
+        auto q1 = quadrants[i];
+        auto q2 = quadrants[j];
+        if (q1 == q2) {
+            continue;
+        }
+        const auto ori1 = predicates::orient2d(va.data(), vb.data(), zero.data());
+        if (q2 < q1) {
+            q2 += 4;
+        }
+        const auto quadrant_span = q2 - q1;
+        if (quadrant_span > 2 || (quadrant_span == 2 && ori1 < 0.0)) {
+            q2 %= 4;
+            std::swap(q1, q2);
+            if (q2 < q1) {
+                q2 += 4;
+            }
+        }
+        for (std::size_t q = q1 + 1; q <= q2; q++) {
+            const auto ori2 = predicates::orient2d(va.data(), vb.data(), &corners[(q % 4) * 2]);
+            if (ori1 * ori2 < 0.0) {
+                const auto t = std::abs(ori1) / (std::abs(ori1) + std::abs(ori2));
+                if (!scale.has_value() || t < *scale) {
+                    scale = t;
+                }
             }
         }
     }
