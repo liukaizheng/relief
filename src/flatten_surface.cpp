@@ -499,7 +499,8 @@ FlattenSurface::FlattenSurface(VMat&& V, FMat&& F, const std::vector<std::size_t
     // write_uv("uv_init.obj", uv, this->F);
 }
 
-void FlattenSurface::slim_solve(const std::size_t n_iterations) {
+void FlattenSurface::slim_solve(const std::size_t n_min_iter, const std::size_t n_max_iter) {
+    constexpr double TERMINATE_EPS = 0.03;
     Eigen::Index n_free = this->V.rows() - n_bnd_points;
     auto [B1, B2, normal, DA, IFV, G] = tri_gradients(this->V, this->F);
     this->N = normal;
@@ -563,7 +564,7 @@ void FlattenSurface::slim_solve(const std::size_t n_iterations) {
         return energy;
     };
 
-    for (std::size_t _ = 0; _ < n_iterations; ++_) {
+    for (std::size_t iter = 0; iter < n_max_iter; iter++) {
         update_jacobian(uv);
 
         // update rotation and weight matrices
@@ -589,7 +590,11 @@ void FlattenSurface::slim_solve(const std::size_t n_iterations) {
 
         Eigen::SimplicialLDLT<Eigen::SparseMatrix<double> > solver;
         new_uv.bottomRows(V.rows() - n_bnd_points).reshaped() = solver.compute(L).solve(real_rhs);
+        const auto old_energy = energy;
         energy = flip_avoiding_line_search(F, uv, new_uv, compute_energy, energy);
+        if (iter >= n_min_iter && std::abs(old_energy - energy) / energy < TERMINATE_EPS) {
+            break;
+        }
         std::cout << "Energy: " << energy << std::endl;
         uv = new_uv;
     }

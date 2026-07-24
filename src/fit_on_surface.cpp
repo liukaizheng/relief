@@ -695,7 +695,9 @@ void add_face_inner_vertices(
         auto new_vid = mesh.new_vertices(vertices.size());
         for (std::size_t i = 0; i < vertices.size(); ++i) {
             std::span<double, 3> bary { bary_coords.data() + i * 3, 3 };
-            gpf::detail::normalize_barycentric(bary, gpf::detail::BARY_EPS);
+            // There is no need to normalize the barycentric coordinates: the point is
+            // guaranteed to lie inside the triangle. Normalization could make two
+            // previously disjoint segments appear to intersect after the adjustment.
             Eigen::Vector3d::Map(mesh.vertex_prop(new_vid).pt.data()) = bary[0] * pa + bary[1] * pb + bary[2] * pc;
             local_to_mesh_vertex[vertices[i].idx] = new_vid;
             new_vid.idx += 1;
@@ -944,7 +946,7 @@ void fit_polygon_on_surface(
     // local SLIM distortion minimization.  See
     // docs/SLIM_ldlt_nullspace_explanation.md for the full derivation.
     FlattenSurface fs(std::move(V), std::move(F), std::move(uv), 1);
-    fs.slim_solve(5);
+    fs.slim_solve(5, 15);
     write_uv_as_off(fs.uv, fs.F, "fit_polygon_on_surface_uv.off");
     write_faces_as_off(mesh, inner_faces, "fit_polygon_on_surface.off");
 

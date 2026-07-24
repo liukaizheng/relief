@@ -10,7 +10,7 @@ public:
     FlattenSurface(VMat &&V, FMat &&F, VMat2&& uv, const std::size_t n_bnd_points) noexcept;
     FlattenSurface(VMat &&V, FMat &&F, const std::size_t n_bnd_points) noexcept;
 
-    void slim_solve(const std::size_t n_iterations);
+    void slim_solve(const std::size_t n_min_iter, const std::size_t n_max_iter);
 public:
 
     VMat V;

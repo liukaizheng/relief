@@ -1655,7 +1655,7 @@ auto embed_planar_grid_boundary1(
     CGAL::IO::write_polygon_soup("mesh2.obj", local_patch_points, local_patch_faces);
     auto eigen_data = mesh_to_eigen_mat(local_patch_points, local_patch_faces);
     FlattenSurface fs(std::move(eigen_data.first), std::move(eigen_data.second), boundary_halfedges.size());
-    fs.slim_solve(20);
+    fs.slim_solve(5, 15);
     write_uv("uv.obj", fs.uv, fs.F);
     const auto local_center_vid = vertex_point_map[center_vid_index];
 
@@ -1954,7 +1954,7 @@ void long_time_slim() {
     VMat2 uv1 = uv;
     FlattenSurface fs(std::move(V), std::move(F), std::move(uv1), 0);
     auto start = std::chrono::high_resolution_clock::now();
-    fs.slim_solve(10);
+    fs.slim_solve(5, 15);
     auto end = std::chrono::high_resolution_clock::now();
     std::cout << "Time: " << std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count() << "ms" << std::endl;
 }
