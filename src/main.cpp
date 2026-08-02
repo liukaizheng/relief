@@ -1717,7 +1717,7 @@ auto embed_planar_grid_boundary1(
 
 auto get_height_mat(Mesh& mesh, const Point_3& min_pt, const std::size_t grid_dimension, const double stride)
 {
-    Eigen::MatrixXd height_mat = Eigen::MatrixXd::Constant(grid_dimension, grid_dimension, std::numeric_limits<double>::quiet_NaN());
+    auto height_mat = Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>::Constant(grid_dimension, grid_dimension, std::numeric_limits<double>::quiet_NaN()).eval();
     MatXu index_mat = MatXu::Zero(grid_dimension, grid_dimension);
     for (const auto vid : mesh.vertices()) {
         const auto& pt = mesh.point(vid);
@@ -1849,7 +1849,7 @@ auto get_top_boundary(const std::size_t grid_dimensioin, const MatXu& index_mat)
 
 } // namespace
 
-int main1(int argc, char** argv)
+int main(int argc, char** argv)
 {
     CLI::App app { "Relief App" };
     std::string mesh_path;
@@ -1902,6 +1902,28 @@ int main1(int argc, char** argv)
     auto [height_mat, index_mat] = get_height_mat(relief, bounds->min, grid_dimension, (bounds->max.x() - bounds->min.x()) / (grid_dimension - 1));
     height_mat = (height_mat.array() - min_z) * scale;
     height_mat = height_mat.array() - height_mat.minCoeff();
+    {
+        std::vector<Point_3> mesh_points;
+        std::vector<std::vector<std::size_t>> mesh_faces;
+        CGAL::IO::read_polygon_soup(mesh_path, mesh_points, mesh_faces);
+        auto mesh = image_relief::Mesh::new_in(mesh_faces);
+        for (auto&& [p, v] : std::views::zip(mesh_points, mesh.vertices())) {
+            auto& pt = v.prop().pt;
+            pt[0] = p.x();
+            pt[1] = p.y();
+            pt[2] = p.z();
+        }
+
+        const gpf::FaceId fid{9860};
+        std::array<double, 3> start_pt{};
+        std::vector<gpf::VertexId> vertices = mesh.face(fid).halfedges() | std::views::transform([](auto&& h) { return h.from().id; }) | std::ranges::to<std::vector<gpf::VertexId>>();
+        Eigen::Vector3d::Map(start_pt.data()) = Eigen::Vector3d::Map(mesh.vertex_prop(vertices[0]).pt.data()) * 0.3 + Eigen::Vector3d::Map(mesh.vertex_prop(vertices[1]).pt.data()) * 0.3 + Eigen::Vector3d::Map(mesh.vertex_prop(vertices[2]).pt.data()) * 0.4;
+
+        for (auto face : mesh.faces()) {
+            face.prop().parent = face.id;;
+        }
+        image_relief::make_relief_on_surface(mesh, std::span<const double> { height_mat.data(), grid_dimension * grid_dimension}, grid_dimension, fid, start_pt, {0.3, 0.0, 0.0});
+    }
 
     Eigen::Vector2d min_pt(bounds->min.x(), bounds->min.y());
     Eigen::Vector2d max_pt(bounds->max.x(), bounds->max.y());
@@ -2014,12 +2036,12 @@ void test_fit_on_surface(const std::string& mesh_path) {
         face.prop().parent = face.id;;
     }
 
-    fit_polygon_on_surface(mesh, polygon_points, polygons, start_pt, fid, {0.3, 0.0, 0.0});
+    fit_on_surface::fit_polygon_on_surface(mesh, polygon_points, polygons, start_pt, fid, {0.3, 0.0, 0.0});
 
     const auto a = 2;
 }
 
-int main(int argc, char** argv) {
+int main1(int argc, char** argv) {
     CLI::App app { "Fit App" };
     std::string mesh_path;
     std::string relief_path;
