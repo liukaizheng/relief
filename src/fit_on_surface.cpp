@@ -255,13 +255,14 @@ inline std::size_t find_anchor_corner_index(const VMat2& uv, const std::span<con
                                                                                                                                                                         std::get<1>(pair)); }), {}, &std::pair<double, std::size_t>::first).second;
 }
 
-std::optional<double> boundary_contains_anchor_rectangle(const VMat2& uv, const std::span<const std::size_t> vertices, const std::size_t min_idx, const Eigen::VectorXi& bnd) {
+std::optional<double> boundary_contains_anchor_rectangle(const VMat2& uv, const std::span<const std::size_t> vertices, const std::size_t min_idx, const Eigen::VectorXi& bnd)
+{
     const auto div = [](const auto& a, const auto& b) noexcept {
-        return Eigen::Vector2d{ a.x() * b.x() + a.y() * b.y(), a.y() * b.x() - a.x() * b.y() };
+        return Eigen::Vector2d { a.x() * b.x() + a.y() * b.y(), a.y() * b.x() - a.x() * b.y() };
     };
     Eigen::Vector2d center = uv.row(vertices[0]).transpose();
     Eigen::Vector2d base_dir = uv.row(vertices[min_idx]).transpose() - center;
-    std::vector<double> corners = {base_dir[0], base_dir[1], -base_dir[1], base_dir[0], -base_dir[0], -base_dir[1], base_dir[1], -base_dir[0]};
+    std::vector<double> corners = { base_dir[0], base_dir[1], -base_dir[1], base_dir[0], -base_dir[0], -base_dir[1], base_dir[1], -base_dir[0] };
     const auto half_diag_len = base_dir.norm();
     base_dir /= half_diag_len;
     const auto half_len = half_diag_len / std::numbers::sqrt2;
@@ -281,7 +282,7 @@ std::optional<double> boundary_contains_anchor_rectangle(const VMat2& uv, const 
             return 3;
         }
     };
-    std::optional<double> scale{};
+    std::optional<double> scale {};
     for (Eigen::Index i = 0; i < uv_diff.rows(); i++) {
         Eigen::Vector2d vec = uv_diff.row(i).transpose();
         auto actual_len = vec.norm();
@@ -298,7 +299,7 @@ std::optional<double> boundary_contains_anchor_rectangle(const VMat2& uv, const 
         angle_vec = (rot * angle_vec).eval(); // rotate 45 degree counterclockwise
         quadrants[i] = compute_quadrant(angle_vec.data());
     }
-    Eigen::Vector2d zero{0.0, 0.0};
+    Eigen::Vector2d zero { 0.0, 0.0 };
     for (Eigen::Index i = 0; i < uv_diff.rows(); i++) {
         const auto j = (i + 1) % uv_diff.rows();
         Eigen::Vector2d va = uv_diff.row(i);
@@ -585,11 +586,7 @@ void smooth_grid_points(VMat& points, const std::size_t width)
     for (std::size_t j = 1; j + 1 < width; ++j) {
         for (std::size_t i = 1; i + 1 < width; ++i) {
             const auto point_idx = j * width + i;
-            points.row(point_idx) = 0.25 * (
-                original_points.row(point_idx - 1) +
-                original_points.row(point_idx + 1) +
-                original_points.row(point_idx - width) +
-                original_points.row(point_idx + width));
+            points.row(point_idx) = 0.25 * (original_points.row(point_idx - 1) + original_points.row(point_idx + 1) + original_points.row(point_idx - width) + original_points.row(point_idx + width));
         }
     }
 }
@@ -968,21 +965,19 @@ auto compute_grid_points_and_positions(
     const Eigen::Vector2d& start_pt,
     const Eigen::Vector2d& xaxis,
     const Eigen::Vector2d& yaxis,
-    const std::vector<gpf::VertexId>& local_to_mesh_vertex
-) {
+    const std::vector<gpf::VertexId>& local_to_mesh_vertex)
+{
     const auto point_count = width * width;
-    if (heights.size() != point_count) {
-        throw std::invalid_argument("height count must match the grid size");
-    }
+    assert(heights.size() == point_count);
 
     std::vector<std::array<double, 2>> points(point_count);
     const auto t = 1.0 / static_cast<double>(width - 1);
     const Eigen::Vector2d delta_x = xaxis * t;
     const Eigen::Vector2d delta_y = yaxis * t;
-    std::size_t idx{0};
-    for (std::size_t j{0}; j < width; j++) {
+    std::size_t idx { 0 };
+    for (std::size_t j { 0 }; j < width; j++) {
         Eigen::Vector2d::Map(points[idx++].data()) = start_pt + static_cast<double>(j) * delta_y;
-        for (std::size_t i{1}; i < width; i++) {
+        for (std::size_t i { 1 }; i < width; i++) {
             Eigen::Vector2d::Map(points[idx].data()) = Eigen::Vector2d::Map(points[idx - 1].data()) + delta_x;
             idx++;
         }
@@ -992,15 +987,16 @@ auto compute_grid_points_and_positions(
     // is large enough to classify valid interior samples as edge samples, so
     // keep the tolerance to a small fraction of the smaller cell dimension.
     const auto eps = std::min(1e-3, 0.01 * delta_x.norm());
-    auto [face_info_map, point_vertices, edge_to_points_map] =
-        gpf::detail::prepare_projected_points(points, uv_mesh, eps);
+    const auto start = std::chrono::high_resolution_clock::now();
+    auto [face_info_map, point_vertices, edge_to_points_map] = gpf::detail::prepare_projected_points(points, uv_mesh, eps);
+    std::cout << "elapsed in " << std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - start) << "\n";
 
     VMat N = VMat::Constant(mesh.n_faces_capacity(), 3, std::numeric_limits<double>::quiet_NaN()).eval(); // face normals
     VMat P = VMat::Constant(points.size(), 3, std::numeric_limits<double>::quiet_NaN()).eval();
     using FaceRepr = std::variant<gpf::FaceId, std::array<gpf::VertexId, 3>>;
 
     auto get_face_vertices = [](const auto& mesh, const gpf::FaceId fid) -> std::array<gpf::VertexId, 3> {
-        std::array<gpf::VertexId, 3> vertices{};
+        std::array<gpf::VertexId, 3> vertices {};
         auto he = mesh.face(fid).halfedge();
         vertices[0] = he.to().id;
         he = he.next();
@@ -1011,7 +1007,6 @@ auto compute_grid_points_and_positions(
     };
 
     auto get_face_normal = [&mesh, &N, &get_face_vertices](const FaceRepr face_repr) -> Eigen::RowVector3d {
-
         const auto compute_normal = [&mesh](const std::array<gpf::VertexId, 3>& vertices) {
             const auto pa = Eigen::RowVector3d::Map(mesh.vertex_prop(vertices[0]).pt.data());
             const auto pb = Eigen::RowVector3d::Map(mesh.vertex_prop(vertices[1]).pt.data());
@@ -1019,19 +1014,20 @@ auto compute_grid_points_and_positions(
             return ((pb - pa).cross(pc - pa)).normalized().eval();
         };
 
-        return std::visit([&mesh, &N, &get_face_vertices, &compute_normal] (auto&& arg) {
+        return std::visit([&mesh, &N, &get_face_vertices, &compute_normal](auto&& arg) {
             using T = std::decay_t<decltype(arg)>;
             if constexpr (std::is_same_v<T, gpf::FaceId>) {
                 auto row = N.row(arg.idx);
                 if (!std::isnan(row[0])) {
-                    return Eigen::RowVector3d{row};
+                    return Eigen::RowVector3d { row };
                 }
                 row = compute_normal(get_face_vertices(mesh, arg));
-                return Eigen::RowVector3d{row};
+                return Eigen::RowVector3d { row };
             } else {
                 return compute_normal(arg);
             }
-        }, face_repr);
+        },
+            face_repr);
     };
 
     for (const auto& [uv_fid, info] : face_info_map) {
@@ -1072,7 +1068,7 @@ auto compute_grid_points_and_positions(
         for (const auto he : mesh.edge(mesh_eid).halfedges()) {
             const auto mesh_fid = he.face().id;
             if (mesh_fid.valid()) {
-                normal += get_face_normal(FaceRepr{mesh_fid});
+                normal += get_face_normal(FaceRepr { mesh_fid });
             }
         }
         normal.normalize();
@@ -1094,7 +1090,7 @@ auto compute_grid_points_and_positions(
         }
     }
 
-    for (std::size_t i{0}; i < points.size(); i++) {
+    for (std::size_t i { 0 }; i < points.size(); i++) {
         if (!std::isnan(P(i, 0))) {
             continue;
         }
@@ -1105,7 +1101,7 @@ auto compute_grid_points_and_positions(
         for (const auto he : mesh.vertex(mesh_vid).incoming_halfedges()) {
             const auto mesh_fid = he.face().id;
             if (mesh_fid.valid()) {
-                normal += get_face_normal(FaceRepr{mesh_fid});
+                normal += get_face_normal(FaceRepr { mesh_fid });
             }
         }
         normal.normalize();
@@ -1114,7 +1110,8 @@ auto compute_grid_points_and_positions(
     }
     return std::make_tuple(std::move(points), std::move(P), eps);
 }
-auto get_grid_boundary_points_and_indices(const std::vector<std::array<double, 2>>& points , std::size_t width) {
+auto get_grid_boundary_points_and_indices(const std::vector<std::array<double, 2>>& points, std::size_t width)
+{
     const auto index_mat = MatXu::Constant(width, width, gpf::kInvalidIndex).eval();
     std::vector<std::array<double, 2>> grid_boundary_points;
     std::vector<std::size_t> grid_boundary_point_indices;
@@ -1126,8 +1123,8 @@ auto get_grid_boundary_points_and_indices(const std::vector<std::array<double, 2
         grid_boundary_points.push_back(points[i]);
         grid_boundary_point_indices.push_back(i);
     }
-    //right
-    std::size_t idx{width - 1};
+    // right
+    std::size_t idx { width - 1 };
     for (std::size_t j = 0; j + 1 < width; j++) {
         grid_boundary_points.push_back(points[idx]);
         grid_boundary_point_indices.push_back(idx);
@@ -1148,11 +1145,12 @@ auto get_grid_boundary_points_and_indices(const std::vector<std::array<double, 2
     return std::make_pair(std::move(grid_boundary_points), std::move(grid_boundary_point_indices));
 }
 
-auto compute_boundary_vertex_separators(const uv::Mesh& mesh, const std::vector<gpf::VertexId>& vertices, const std::vector<gpf::HalfedgeId>& halfedges) {
+auto compute_boundary_vertex_separators(const uv::Mesh& mesh, const std::vector<gpf::VertexId>& vertices, const std::vector<gpf::HalfedgeId>& halfedges)
+{
     std::vector<std::size_t> separators;
     separators.reserve(vertices.size() + 1);
     separators.push_back(0);
-    std::size_t vidx {1};
+    std::size_t vidx { 1 };
     auto vid = vertices[vidx];
     for (std::size_t i = 0; i < halfedges.size(); i++) {
         if (mesh.he_to(halfedges[i]) == vid) {
@@ -1163,9 +1161,7 @@ auto compute_boundary_vertex_separators(const uv::Mesh& mesh, const std::vector<
     if (separators.size() != vertices.size()) {
         const auto missing_vertex = vidx < vertices.size() ? std::to_string(vertices[vidx].idx) : "unknown";
         throw std::runtime_error(
-            "could not find boundary separator for vertex " + missing_vertex + ": found " +
-            std::to_string(separators.size() - 1) + " of " + std::to_string(vertices.size() - 1) +
-            " expected vertices while scanning " + std::to_string(halfedges.size()) + " halfedges");
+            "could not find boundary separator for vertex " + missing_vertex + ": found " + std::to_string(separators.size() - 1) + " of " + std::to_string(vertices.size() - 1) + " expected vertices while scanning " + std::to_string(halfedges.size()) + " halfedges");
     }
     separators.push_back(halfedges.size());
     return separators;
@@ -1225,7 +1221,7 @@ void fit_polygon_on_surface(
     for (auto [fid, bary_coords] : corner_points) {
         outer_corner_points.push_back(face_point(mesh, fid, bary_coords));
     }
-    constexpr double EPS{1e-3};
+    constexpr double EPS { 1e-3 };
 
     auto [project_vertices, boundary_paths] = gpf::project_polylines_on_mesh(
         outer_corner_points,
@@ -1236,8 +1232,8 @@ void fit_polygon_on_surface(
     auto uv_mesh = uv::Mesh::new_in(ranges::iota_view { std::size_t { 0 }, inner_faces.size() } | views::transform([&inner_face_indices](auto idx) { return std::span<const std::size_t, 3> { inner_face_indices.data() + idx * 3, 3 }; }));
     Eigen::VectorXi bnd(n_boundary_vertices);
     {
-        auto curr_he = uv_mesh.vertex(gpf::VertexId{0}).halfedge().prev();
-        Eigen::Index idx{0};
+        auto curr_he = uv_mesh.vertex(gpf::VertexId { 0 }).halfedge().prev();
+        Eigen::Index idx { 0 };
         const auto first_hid = curr_he.id;
         while (true) {
             bnd(idx++) = static_cast<int>(curr_he.to().id.idx);
@@ -1319,8 +1315,8 @@ std::vector<GridFaceIndex> make_relief_on_surface(
     const std::size_t width,
     const gpf::FaceId fid,
     const std::array<double, 3>& surface_point,
-    const std::array<double, 3>& direction
-) {
+    const std::array<double, 3>& direction)
+{
     if (width < 2) {
         throw std::invalid_argument("grid width must be at least 2");
     }
@@ -1397,8 +1393,8 @@ std::vector<GridFaceIndex> make_relief_on_surface(
     auto uv_mesh = uv::Mesh::new_in(ranges::iota_view { std::size_t { 0 }, inner_faces.size() } | views::transform([&inner_face_indices](auto idx) { return std::span<const std::size_t, 3> { inner_face_indices.data() + idx * 3, 3 }; }));
     Eigen::VectorXi bnd(n_boundary_vertices);
     {
-        auto curr_he = uv_mesh.vertex(gpf::VertexId{0}).halfedge().prev();
-        Eigen::Index idx{0};
+        auto curr_he = uv_mesh.vertex(gpf::VertexId { 0 }).halfedge().prev();
+        Eigen::Index idx { 0 };
         const auto first_hid = curr_he.id;
         while (true) {
             bnd(idx++) = static_cast<int>(curr_he.to().id.idx);
@@ -1460,7 +1456,7 @@ std::vector<GridFaceIndex> make_relief_on_surface(
     auto [grid_boundary_points, grid_boundary_point_indices] = get_grid_boundary_points_and_indices(grid_points, width);
     std::vector<std::size_t> boundary_polylines;
     boundary_polylines.reserve(grid_boundary_point_indices.size());
-    for (std::size_t i{0}; i < grid_boundary_point_indices.size(); i++) {
+    for (std::size_t i { 0 }; i < grid_boundary_point_indices.size(); i++) {
         boundary_polylines.push_back(i);
     }
     boundary_polylines.push_back(0);
@@ -1496,20 +1492,22 @@ std::vector<GridFaceIndex> make_relief_on_surface(
         FaceProp prop;
     };
 
-    // Keep the source vertex IDs for the part of the input mesh outside the
-    // extracted patch.  Using those IDs for the retained faces is what makes
-    // the rebuilt mesh remain connected to the untouched source surface.
-    const auto old_vertex_capacity = mesh.n_vertices_capacity();
+    const auto n_old_mesh_vertices = mesh.n_vertices_capacity();
     std::vector<std::array<double, 3>> output_positions;
-    output_positions.reserve(old_vertex_capacity + width * width + uv_mesh.n_vertices_capacity());
-    for (std::size_t i = 0; i < old_vertex_capacity; ++i) {
-        output_positions.push_back(mesh.vertex_prop(gpf::VertexId { i }).pt);
-    }
-
+    output_positions.reserve(n_old_mesh_vertices + width * width + uv_mesh.n_vertices_capacity());
     std::vector<bool> is_inner_face(mesh.n_faces_capacity(), false);
     for (const auto inner_fid : inner_faces) {
         is_inner_face[inner_fid.idx] = true;
     }
+    std::vector<std::size_t> old_mesh_vertex_map(n_old_mesh_vertices, gpf::kInvalidIndex);
+    const auto add_mesh_vertices_to_output = [&mesh, &old_mesh_vertex_map, &output_positions](const gpf::VertexId old_vid) {
+        if (auto new_vid = old_mesh_vertex_map[old_vid.idx]; new_vid != gpf::kInvalidIndex) {
+            return new_vid;
+        }
+        const auto ret = old_mesh_vertex_map[old_vid.idx] = output_positions.size();
+        output_positions.push_back(mesh.vertex_prop(old_vid).pt);
+        return ret;
+    };
 
     std::vector<OutputFace> output_faces;
     std::vector<GridFaceIndex> grid_face_indices;
@@ -1520,12 +1518,12 @@ std::vector<GridFaceIndex> make_relief_on_surface(
         }
         OutputFace output_face { {}, face.prop() };
         for (const auto he : face.halfedges()) {
-            output_face.vertices.push_back(he.from().id.idx);
+            output_face.vertices.push_back(add_mesh_vertices_to_output(he.to().id));
         }
         output_faces.push_back(std::move(output_face));
     }
 
-    std::vector<gpf::VertexId> mesh_to_uv(old_vertex_capacity);
+    std::vector<gpf::VertexId> mesh_to_uv(n_old_mesh_vertices);
     for (std::size_t uv_idx = 0; uv_idx < local_to_mesh_vertex.size(); ++uv_idx) {
         const auto mesh_vid = local_to_mesh_vertex[uv_idx];
         if (mesh_vid.valid()) {
@@ -1533,182 +1531,117 @@ std::vector<GridFaceIndex> make_relief_on_surface(
         }
     }
 
-    auto uv_point = [&uv_mesh](const gpf::VertexId vid) {
-        return Eigen::Vector2d::Map(uv_mesh.vertex_prop(vid).pt.data()).eval();
-    };
-
-    auto source_point_for_uv_vertex = [&](const gpf::VertexId uv_vid) -> std::array<double, 3> {
-        for (const auto uv_face : uv_mesh.faces()) {
-            bool contains_vertex = false;
-            for (const auto he : uv_face.halfedges()) {
-                if (he.from().id == uv_vid) {
-                    contains_vertex = true;
-                    break;
-                }
-            }
-            if (!contains_vertex) {
-                continue;
-            }
-
-            const auto parent_iter = uv_face_parent_map.find(uv_face.id);
-            const auto root = parent_iter != uv_face_parent_map.end() ? parent_iter->second : uv_face.id;
-            if (!root.valid() || root.idx >= inner_faces.size()) {
-                continue;
-            }
-            const auto source_fid = inner_faces[root.idx];
-            if (!source_fid.valid() || source_fid.idx >= mesh.n_faces_capacity() || mesh.face_is_deleted(source_fid)) {
-                continue;
-            }
-
-            std::array<gpf::VertexId, 3> source_vertices;
-            std::size_t source_index = 0;
-            for (const auto source_he : mesh.face(source_fid).halfedges()) {
-                if (source_index == source_vertices.size()) {
-                    break;
-                }
-                source_vertices[source_index++] = source_he.from().id;
-            }
-            if (source_index != source_vertices.size()) {
-                continue;
-            }
-
-            std::array<gpf::VertexId, 3> source_uv_vertices;
-            bool all_source_vertices_are_mapped = true;
-            for (std::size_t i = 0; i < source_vertices.size(); ++i) {
-                const auto source_vid = source_vertices[i];
-                if (source_vid.idx >= mesh_to_uv.size() || !mesh_to_uv[source_vid.idx].valid()) {
-                    all_source_vertices_are_mapped = false;
-                    break;
-                }
-                source_uv_vertices[i] = mesh_to_uv[source_vid.idx];
-            }
-            if (!all_source_vertices_are_mapped) {
-                continue;
-            }
-
-            const auto a = uv_point(source_uv_vertices[0]);
-            const auto b = uv_point(source_uv_vertices[1]);
-            const auto c = uv_point(source_uv_vertices[2]);
-            const auto p = uv_point(uv_vid);
-            const auto cross = [](const Eigen::Vector2d& x, const Eigen::Vector2d& y) {
-                return x.x() * y.y() - x.y() * y.x();
-            };
-            const auto denominator = cross(b - a, c - a);
-            if (std::abs(denominator) < 1e-14) {
-                continue;
-            }
-            const std::array<double, 3> barycentric {
-                cross(b - p, c - p) / denominator,
-                cross(c - p, a - p) / denominator,
-                cross(a - p, b - p) / denominator,
-            };
-            constexpr double barycentric_tolerance = 1e-6;
-            if (ranges::any_of(barycentric, [](const double value) {
-                    return value < -barycentric_tolerance || value > 1.0 + barycentric_tolerance;
-                })) {
-                continue;
-            }
-
-            std::array<double, 3> result {};
-            for (std::size_t i = 0; i < result.size(); ++i) {
-                const auto& source_point = mesh.vertex_prop(source_vertices[i]).pt;
-                for (std::size_t coordinate = 0; coordinate < result.size(); ++coordinate) {
-                    result[coordinate] += barycentric[i] * source_point[coordinate];
-                }
-            }
-            return result;
-        }
-        for (const auto uv_edge : uv_mesh.edges()) {
-            if (uv_edge.vertices()[0].id != uv_vid && uv_edge.vertices()[1].id != uv_vid) {
-                continue;
-            }
-            const auto parent_iter = uv_edge_parent_map.find(uv_edge.id);
-            if (parent_iter == uv_edge_parent_map.end() || parent_iter->second.idx >= original_uv_edge_vertices.size()) {
-                continue;
-            }
-            const auto source_uv_edge = original_uv_edge_vertices[parent_iter->second.idx];
-            if (!source_uv_edge[0].valid() || !source_uv_edge[1].valid() ||
-                source_uv_edge[0].idx >= local_to_mesh_vertex.size() || source_uv_edge[1].idx >= local_to_mesh_vertex.size()) {
-                continue;
-            }
-            const auto source_a = local_to_mesh_vertex[source_uv_edge[0].idx];
-            const auto source_b = local_to_mesh_vertex[source_uv_edge[1].idx];
-            if (!source_a.valid() || !source_b.valid()) {
-                continue;
-            }
-            const auto a = uv_point(source_uv_edge[0]);
-            const auto b = uv_point(source_uv_edge[1]);
-            const auto edge_vector = b - a;
-            const auto edge_length_squared = edge_vector.squaredNorm();
-            if (edge_length_squared < 1e-14) {
-                continue;
-            }
-            const auto t = std::clamp((uv_point(uv_vid) - a).dot(edge_vector) / edge_length_squared, 0.0, 1.0);
-            std::array<double, 3> result {};
-            const auto& point_a = mesh.vertex_prop(source_a).pt;
-            const auto& point_b = mesh.vertex_prop(source_b).pt;
-            for (std::size_t coordinate = 0; coordinate < result.size(); ++coordinate) {
-                result[coordinate] = (1.0 - t) * point_a[coordinate] + t * point_b[coordinate];
-            }
-            return result;
-        }
-
-        throw std::runtime_error(
-            "could not map projected UV vertex " + std::to_string(uv_vid.idx) + " to a source face or edge");
-    };
-
     std::vector<std::size_t> uv_output_vertices(uv_mesh.n_vertices_capacity(), gpf::kInvalidIndex);
+
+    std::unordered_map<gpf::EdgeId, std::vector<gpf::EdgeId>> parent_edge_to_edges_map;
+    for (const auto [uv_eid, uv_parent_eid] : uv_edge_parent_map) {
+        parent_edge_to_edges_map[uv_parent_eid].push_back(uv_eid);
+    }
+
+    const auto add_points_on_edge = [&](const gpf::EdgeId parent_eid, std::vector<gpf::EdgeId>& subedges) {
+        const auto [uv_va, uv_vb] = original_uv_edge_vertices[parent_eid.idx];
+        const auto va = local_to_mesh_vertex[uv_va.idx];
+        const auto vb = local_to_mesh_vertex[uv_vb.idx];
+        const auto uv_pa = Eigen::Vector2d::Map(uv_mesh.vertex_prop(uv_va).pt.data());
+        const auto uv_pb = Eigen::Vector2d::Map(uv_mesh.vertex_prop(uv_vb).pt.data());
+        const auto pa = Eigen::Vector3d::Map(mesh.vertex_prop(va).pt.data());
+        const auto pb = Eigen::Vector3d::Map(mesh.vertex_prop(vb).pt.data());
+        const auto uv_vab = (uv_pb - uv_pa).eval();
+        const auto square_len = uv_vab.squaredNorm();
+
+        subedges.push_back(parent_eid);
+        for (const auto eid : subedges) {
+            for (const auto vid : uv_mesh.e_vertices(eid)) {
+                if (vid.idx < local_to_mesh_vertex.size() || uv_output_vertices[vid.idx] != gpf::kInvalidIndex) {
+                    continue;
+                }
+                const auto uv_pt = Eigen::Vector2d::Map(uv_mesh.vertex_prop(vid).pt.data());
+                const auto t = (uv_pt - uv_pa).dot(uv_vab) / square_len;
+                uv_output_vertices[vid.idx] = output_positions.size();
+                output_positions.push_back({});
+                Eigen::Vector3d::Map(output_positions.back().data()) = (1.0 - t) * pa + t * pb;
+            }
+        }
+    };
+
+    for (auto& [parent_eid, subedges] : parent_edge_to_edges_map) {
+        add_points_on_edge(parent_eid, subedges);
+    }
+
+    std::unordered_map<gpf::FaceId, std::vector<gpf::FaceId>> parent_face_to_faces_map;
+    for (const auto [uv_fid, uv_parent_fid] : uv_face_parent_map) {
+        parent_face_to_faces_map[uv_parent_fid].push_back(uv_fid);
+    }
+
+    const auto add_points_on_face = [&](const gpf::FaceId parent_fid, std::vector<gpf::FaceId>& subfaces) {
+        const auto source_fid = inner_faces[parent_fid.idx];
+        std::array<gpf::VertexId, 3> source_vertices;
+        std::array<gpf::VertexId, 3> source_uv_vertices;
+        for (const auto [idx, he] : views::zip(
+                 ranges::iota_view { std::size_t { 0 }, std::size_t { 3 } },
+                 mesh.face(source_fid).halfedges())) {
+            source_vertices[idx] = he.from().id;
+            source_uv_vertices[idx] = mesh_to_uv[source_vertices[idx].idx];
+        }
+
+        const auto uv_pa = Eigen::Vector2d::Map(uv_mesh.vertex_prop(source_uv_vertices[0]).pt.data());
+        const auto uv_pb = Eigen::Vector2d::Map(uv_mesh.vertex_prop(source_uv_vertices[1]).pt.data());
+        const auto uv_pc = Eigen::Vector2d::Map(uv_mesh.vertex_prop(source_uv_vertices[2]).pt.data());
+        const auto pa = Eigen::Vector3d::Map(mesh.vertex_prop(source_vertices[0]).pt.data());
+        const auto pb = Eigen::Vector3d::Map(mesh.vertex_prop(source_vertices[1]).pt.data());
+        const auto pc = Eigen::Vector3d::Map(mesh.vertex_prop(source_vertices[2]).pt.data());
+        const auto denominator = (uv_pb - uv_pa).cross(uv_pc - uv_pa);
+
+        subfaces.push_back(parent_fid);
+        for (const auto fid : subfaces) {
+            for (const auto he : uv_mesh.face(fid).halfedges()) {
+                const auto vid = he.from().id;
+                if (vid.idx < local_to_mesh_vertex.size() || uv_output_vertices[vid.idx] != gpf::kInvalidIndex) {
+                    continue;
+                }
+
+                const auto uv_pt = Eigen::Vector2d::Map(uv_mesh.vertex_prop(vid).pt.data());
+                const std::array<double, 3> barycentric {
+                    (uv_pb - uv_pt).cross(uv_pc - uv_pt) / denominator,
+                    (uv_pc - uv_pt).cross(uv_pa - uv_pt) / denominator,
+                    (uv_pa - uv_pt).cross(uv_pb - uv_pt) / denominator,
+                };
+                uv_output_vertices[vid.idx] = output_positions.size();
+                output_positions.push_back({});
+                Eigen::Vector3d::Map(output_positions.back().data()) = barycentric[0] * pa + barycentric[1] * pb + barycentric[2] * pc;
+            }
+        }
+    };
+
+    for (auto& [parent_fid, subfaces] : parent_face_to_faces_map) {
+        add_points_on_face(parent_fid, subfaces);
+    }
+
     auto output_vertex_for_uv_vertex = [&](const gpf::VertexId uv_vid) {
         auto& output_vid = uv_output_vertices[uv_vid.idx];
         if (output_vid != gpf::kInvalidIndex) {
             return output_vid;
         }
 
-        if (uv_vid.idx < local_to_mesh_vertex.size() && local_to_mesh_vertex[uv_vid.idx].valid()) {
-            output_vid = local_to_mesh_vertex[uv_vid.idx].idx;
-        } else {
-            output_vid = output_positions.size();
-            output_positions.push_back(source_point_for_uv_vertex(uv_vid));
+        if (uv_vid.idx < local_to_mesh_vertex.size()) {
+            output_vid = add_mesh_vertices_to_output(local_to_mesh_vertex[uv_vid.idx]);
         }
+        assert(output_vid != gpf::kInvalidIndex);
         return output_vid;
     };
-
-    for (std::size_t boundary_idx = 0; boundary_idx < grid_boundary_vertices.size(); ++boundary_idx) {
-        const auto uv_vid = grid_boundary_vertices[boundary_idx];
-        if (uv_output_vertices[uv_vid.idx] != gpf::kInvalidIndex) {
-            continue;
-        }
-        uv_output_vertices[uv_vid.idx] = output_positions.size();
-        std::array<double, 3> raised_point {};
-        const auto grid_idx = grid_boundary_point_indices[boundary_idx];
-        for (std::size_t coordinate = 0; coordinate < raised_point.size(); ++coordinate) {
-            raised_point[coordinate] = P(static_cast<Eigen::Index>(grid_idx), static_cast<Eigen::Index>(coordinate));
-        }
-        output_positions.push_back(raised_point);
-    }
 
     for (const auto uv_fid : kept_uv_faces) {
         OutputFace output_face { {}, FaceProp { uv_mesh.face_prop(uv_fid).parent } };
         for (const auto he : uv_mesh.face(uv_fid).halfedges()) {
-            output_face.vertices.push_back(output_vertex_for_uv_vertex(he.from().id));
-        }
-        if (output_face.vertices.size() < 3) {
-            throw std::runtime_error("kept UV face is not a polygon");
+            output_face.vertices.push_back(output_vertex_for_uv_vertex(he.to().id));
         }
         output_faces.push_back(std::move(output_face));
     }
 
     std::vector<std::size_t> grid_output_vertices(width * width, gpf::kInvalidIndex);
-    for (std::size_t boundary_idx = 0; boundary_idx < grid_boundary_vertices.size(); ++boundary_idx) {
-        const auto grid_idx = grid_boundary_point_indices[boundary_idx];
-        const auto output_vid = output_vertex_for_uv_vertex(grid_boundary_vertices[boundary_idx]);
-        grid_output_vertices[grid_idx] = output_vid;
-
-        std::array<double, 3> raised_point {};
-        for (std::size_t coordinate = 0; coordinate < raised_point.size(); ++coordinate) {
-            raised_point[coordinate] = P(static_cast<Eigen::Index>(grid_idx), static_cast<Eigen::Index>(coordinate));
-        }
-        output_positions[output_vid] = raised_point;
+    for (std::size_t i = 0; i < grid_boundary_vertices.size(); i++) {
+        assert(uv_output_vertices[grid_boundary_vertices[i].idx] != gpf::kInvalidIndex);
+        grid_output_vertices[grid_boundary_point_indices[i]] = uv_output_vertices[grid_boundary_vertices[i].idx];
     }
 
     for (std::size_t grid_idx = 0; grid_idx < grid_output_vertices.size(); ++grid_idx) {
@@ -1717,14 +1650,12 @@ std::vector<GridFaceIndex> make_relief_on_surface(
         }
         grid_output_vertices[grid_idx] = output_positions.size();
         std::array<double, 3> point {};
-        for (std::size_t coordinate = 0; coordinate < point.size(); ++coordinate) {
-            point[coordinate] = P(static_cast<Eigen::Index>(grid_idx), static_cast<Eigen::Index>(coordinate));
-        }
-        output_positions.push_back(point);
+        Eigen::Vector3d::Map(point.data()) = P.row(grid_idx);
+        output_positions.push_back(std::move(point));
     }
 
     struct GridPolygonVertex {
-        std::size_t output_vertex;
+        std::size_t output_vid;
         std::array<double, 2> uv;
     };
 
@@ -1743,16 +1674,11 @@ std::vector<GridFaceIndex> make_relief_on_surface(
             const auto uv_vertex = uv_mesh.he_to(projected_boundary_halfedges[path_idx]);
             chain.push_back({ output_vertex_for_uv_vertex(uv_vertex), uv_mesh.vertex_prop(uv_vertex).pt });
         }
-        if (chain.back().output_vertex != output_vertex_for_uv_vertex(grid_boundary_vertices[(boundary_idx + 1) % boundary_chains.size()])) {
-            throw std::runtime_error("projected boundary chain does not end at the next grid vertex");
-        }
     }
 
     const auto append_edge = [](std::vector<GridPolygonVertex>& polygon, const std::span<const GridPolygonVertex> edge) {
-        for (const auto vertex : edge) {
-            if (polygon.empty() || polygon.back().output_vertex != vertex.output_vertex) {
-                polygon.push_back(vertex);
-            }
+        for (const auto vertex : edge.subspan(0, edge.size() - 1)) {
+            polygon.push_back(vertex);
         }
     };
     const auto grid_vertex = [&grid_output_vertices, &grid_points, width](const std::size_t row, const std::size_t column) {
@@ -1765,88 +1691,105 @@ std::vector<GridFaceIndex> make_relief_on_surface(
     };
 
     for (std::size_t row = 0; row + 1 < width; ++row) {
-        for (std::size_t column = 0; column + 1 < width; ++column) {
+        for (std::size_t col = 0; col + 1 < width; ++col) {
             std::vector<GridPolygonVertex> polygon;
+            polygon.reserve(4);
             if (row == 0) {
-                append_edge(polygon, boundary_chain(column));
+                append_edge(polygon, boundary_chain(col));
             } else {
-                const std::array<GridPolygonVertex, 2> edge {
-                    grid_vertex(row, column),
-                    grid_vertex(row, column + 1),
-                };
-                append_edge(polygon, edge);
+                polygon.push_back(grid_vertex(row, col));
             }
 
-            if (column + 1 == width - 1) {
+            if (col + 1 == width - 1) {
                 append_edge(polygon, boundary_chain(n_boundary_segments_per_side + row));
             } else {
-                const std::array<GridPolygonVertex, 2> edge {
-                    grid_vertex(row, column + 1),
-                    grid_vertex(row + 1, column + 1),
-                };
-                append_edge(polygon, edge);
+                polygon.push_back(grid_vertex(row, col + 1));
             }
 
             if (row + 1 == width - 1) {
-                const auto boundary_idx = 2 * n_boundary_segments_per_side + (n_boundary_segments_per_side - 1 - column);
+                const auto boundary_idx = 2 * n_boundary_segments_per_side + (n_boundary_segments_per_side - 1 - col);
                 append_edge(polygon, boundary_chain(boundary_idx));
             } else {
-                const std::array<GridPolygonVertex, 2> edge {
-                    grid_vertex(row + 1, column + 1),
-                    grid_vertex(row + 1, column),
-                };
-                append_edge(polygon, edge);
+                polygon.push_back(grid_vertex(row + 1, col + 1));
             }
 
-            if (column == 0) {
+            if (col == 0) {
                 const auto boundary_idx = 3 * n_boundary_segments_per_side + (n_boundary_segments_per_side - 1 - row);
                 append_edge(polygon, boundary_chain(boundary_idx));
             } else {
-                const std::array<GridPolygonVertex, 2> edge {
-                    grid_vertex(row + 1, column),
-                    grid_vertex(row, column),
-                };
-                append_edge(polygon, edge);
+                polygon.push_back(grid_vertex(row + 1, col));
             }
 
-            if (!polygon.empty() && polygon.front().output_vertex == polygon.back().output_vertex) {
-                polygon.pop_back();
-            }
-            if (polygon.size() < 3) {
-                throw std::runtime_error("generated grid cell is degenerate");
+            std::vector<std::size_t> triangles;
+            if (polygon.size() == 4) {
+                triangles = { 0, 1, 3, 1, 2, 3 };
+            } else if (row == 0 && col != 0 && col + 1 != width - 1) {
+                for (std::size_t i { 0 }; i + 1 < polygon.size() - 2; i++) {
+                    triangles.push_back(i);
+                    triangles.push_back(i + 1);
+                    triangles.push_back(polygon.size() - 1);
+                }
+                triangles.push_back(polygon.size() - 3);
+                triangles.push_back(polygon.size() - 2);
+                triangles.push_back(polygon.size() - 1);
+            } else if (col + 1 == width - 1 && row != 0 && row + 1 != width - 1) {
+                for (std::size_t i { 1 }; i + 1 < polygon.size() - 1; i++) {
+                    triangles.push_back(i);
+                    triangles.push_back(i + 1);
+                    triangles.push_back(polygon.size() - 1);
+                }
+                triangles.push_back(0);
+                triangles.push_back(1);
+                triangles.push_back(polygon.size() - 1);
+            } else if (row + 1 == width - 1 && col != 0 && col + 1 != width - 1) {
+                for (std::size_t i { 2 }; i + 1 < polygon.size(); i++) {
+                    triangles.push_back(i);
+                    triangles.push_back(i + 1);
+                    triangles.push_back(1);
+                }
+                triangles.push_back(0);
+                triangles.push_back(1);
+                triangles.push_back(polygon.size() - 1);
+            } else if (col == 0 && row != 0 && row + 1 != width - 1) {
+                for (std::size_t i { 3 }; i + 1 <= polygon.size(); i++) {
+                    triangles.push_back(i);
+                    triangles.push_back((i + 1) % polygon.size());
+                    triangles.push_back(1);
+                }
+                triangles.push_back(1);
+                triangles.push_back(2);
+                triangles.push_back(3);
+            } else {
+                std::vector<double> triangulation_points;
+                triangulation_points.reserve(polygon.size() * 2);
+                std::vector<std::size_t> triangulation_segments;
+                triangulation_segments.reserve(polygon.size() * 2);
+                for (std::size_t i = 0; i < polygon.size(); ++i) {
+                    triangulation_points.push_back(polygon[i].uv[0]);
+                    triangulation_points.push_back(polygon[i].uv[1]);
+                    triangulation_segments.push_back(i);
+                    triangulation_segments.push_back((i + 1) % polygon.size());
+                }
+                triangles = gpf::triangulate_polygon(
+                    triangulation_points,
+                    triangulation_segments,
+                    true);
             }
 
-            std::vector<double> triangulation_points;
-            triangulation_points.reserve(polygon.size() * 2);
-            std::vector<std::size_t> triangulation_segments;
-            triangulation_segments.reserve(polygon.size() * 2);
-            for (std::size_t i = 0; i < polygon.size(); ++i) {
-                triangulation_points.push_back(polygon[i].uv[0]);
-                triangulation_points.push_back(polygon[i].uv[1]);
-                triangulation_segments.push_back(i);
-                triangulation_segments.push_back((i + 1) % polygon.size());
-            }
-            const auto triangle_indices = gpf::triangulate_polygon(
-                triangulation_points,
-                triangulation_segments,
-                true);
-            if (triangle_indices.empty() || triangle_indices.size() % 3 != 0) {
-                throw std::runtime_error("could not triangulate generated grid cell");
-            }
-            for (std::size_t triangle_idx = 0; triangle_idx < triangle_indices.size(); triangle_idx += 3) {
-                const auto triangle_number = triangle_idx / 3;
+            for (std::size_t i = 0; i < triangles.size(); i += 3) {
+                const auto triangle_index = i / 3;
                 grid_face_indices.push_back(GridFaceIndex {
                     gpf::FaceId { output_faces.size() },
-                    row * (width - 1) + column,
+                    row * (width - 1) + col,
                     row,
-                    column,
-                    triangle_number,
+                    col,
+                    triangle_index,
                 });
                 output_faces.push_back(OutputFace {
                     {
-                        polygon[triangle_indices[triangle_idx]].output_vertex,
-                        polygon[triangle_indices[triangle_idx + 1]].output_vertex,
-                        polygon[triangle_indices[triangle_idx + 2]].output_vertex,
+                        polygon[triangles[i]].output_vid,
+                        polygon[triangles[i + 1]].output_vid,
+                        polygon[triangles[i + 2]].output_vid,
                     },
                     FaceProp { fid },
                 });
