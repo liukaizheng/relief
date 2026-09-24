@@ -41,15 +41,22 @@ CPMAddPackage(
 CPMAddPackage(
     NAME gpf-algorithm
     SOURCE_DIR ${CMAKE_CURRENT_LIST_DIR}/../gpf-algorithm
+    OPTIONS "BUILD_TESTING OFF" "GPF_ALGORITHM_BUILD_TESTS OFF"
 )
 
-add_executable(relief_app
+add_library(relief_surface
     src/flatten_surface.cpp
     src/fit_on_surface.cpp
-    src/main.cpp
 )
+target_compile_features(relief_surface PUBLIC cxx_std_23)
+target_include_directories(relief_surface PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(relief_surface PUBLIC Eigen3::Eigen gpf::algorithm
+    PRIVATE fmt::fmt igl::core)
+
+add_executable(relief_app src/main.cpp)
 target_compile_features(relief_app PRIVATE cxx_std_23)
 target_link_libraries(relief_app PRIVATE
+    relief_surface
     fmt::fmt
     CGAL::CGAL
     CLI11::CLI11
@@ -62,6 +69,46 @@ target_link_libraries(relief_app PRIVATE
 target_include_directories(relief_app PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
+
+option(RELIEF_ENABLE_SANITIZERS "Instrument relief targets with AddressSanitizer and UBSan" OFF)
+if(RELIEF_ENABLE_SANITIZERS AND CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(relief_surface PUBLIC -fsanitize=address,undefined -fno-omit-frame-pointer)
+    target_link_options(relief_surface PUBLIC -fsanitize=address,undefined)
+endif()
+
+include(CTest)
+if(BUILD_TESTING)
+    find_package(GTest QUIET)
+    if(NOT GTest_FOUND)
+        CPMAddPackage(
+            NAME googletest
+            GITHUB_REPOSITORY google/googletest
+            GIT_TAG v1.17.0
+            OPTIONS "INSTALL_GTEST OFF" "BUILD_GMOCK OFF"
+        )
+    endif()
+    foreach(module surface_patch fit_on_surface image_relief)
+        # White-box fixtures include fit_on_surface.cpp directly so its private
+        # stages stay in one file. Do not also link a second copy from the library.
+        add_executable(test_${module}
+            tests/surface/test_${module}.cpp
+            src/flatten_surface.cpp
+        )
+        target_link_libraries(test_${module} PRIVATE Eigen3::Eigen gpf::algorithm fmt::fmt igl::core GTest::gtest_main)
+        target_include_directories(test_${module} PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+        )
+        if(RELIEF_ENABLE_SANITIZERS AND CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+            target_compile_options(test_${module} PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
+            target_link_options(test_${module} PRIVATE -fsanitize=address,undefined)
+        endif()
+        set(test_working_directory ${CMAKE_CURRENT_BINARY_DIR}/test-work/${module})
+        file(MAKE_DIRECTORY ${test_working_directory})
+        add_test(NAME test_${module} COMMAND test_${module})
+        set_tests_properties(test_${module} PROPERTIES WORKING_DIRECTORY ${test_working_directory})
+    endforeach()
+endif()
 
 # if(MSVC)
 #     target_compile_options(relief_app PRIVATE /W4 /permissive- /WX)

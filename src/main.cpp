@@ -1922,7 +1922,11 @@ int main(int argc, char** argv)
         for (auto face : mesh.faces()) {
             face.prop().parent = face.id;;
         }
-        image_relief::make_relief_on_surface(mesh, std::span<const double> { height_mat.data(), grid_dimension * grid_dimension}, grid_dimension, fid, start_pt, {0.3, 0.0, 0.0});
+        const auto result = image_relief::make_relief_on_surface(mesh, std::span<const double> { height_mat.data(), grid_dimension * grid_dimension }, grid_dimension, fid, start_pt, { 0.3, 0.0, 0.0 });
+        if (!result) {
+            fmt::print(stderr, "Failed to make relief on surface: {}\n", fit_on_surface::to_string(result.error()));
+            return 1;
+        }
     }
 
     Eigen::Vector2d min_pt(bounds->min.x(), bounds->min.y());
@@ -1981,12 +1985,13 @@ void long_time_slim() {
     std::cout << "Time: " << std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count() << "ms" << std::endl;
 }
 
-void test_fit_on_surface(const std::string& mesh_path) {
+bool test_fit_on_surface(const std::string& mesh_path)
+{
     std::vector<Point_3> mesh_points;
     std::vector<std::vector<std::size_t>> mesh_faces;
     if (!CGAL::IO::read_polygon_soup(mesh_path, mesh_points, mesh_faces)) {
         fmt::print(stderr, "Failed to load relief mesh from {}\n", mesh_path);
-        return;
+        return false;
     }
 
     auto mesh = fit_on_surface::Mesh::new_in(std::move(mesh_faces));
@@ -2036,9 +2041,14 @@ void test_fit_on_surface(const std::string& mesh_path) {
         face.prop().parent = face.id;;
     }
 
-    fit_on_surface::fit_polygon_on_surface(mesh, polygon_points, polygons, start_pt, fid, {0.3, 0.0, 0.0});
+    const auto result = fit_on_surface::fit_polygon_on_surface(mesh, polygon_points, polygons, start_pt, fid, { 0.3, 0.0, 0.0 });
+    if (!result) {
+        fmt::print(stderr, "Failed to fit polygons on surface: {}\n", fit_on_surface::to_string(result.error()));
+        return false;
+    }
 
     const auto a = 2;
+    return true;
 }
 
 int main1(int argc, char** argv) {
@@ -2049,7 +2059,9 @@ int main1(int argc, char** argv) {
     app.add_option("-r,--relief", relief_path, "Path to relief file")->required();
     CLI11_PARSE(app, argc, argv);
 
-    test_fit_on_surface(mesh_path);
+    if (!test_fit_on_surface(mesh_path)) {
+        return 1;
+    }
     long_time_slim();
     return 0;
 }
